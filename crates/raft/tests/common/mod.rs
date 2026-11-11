@@ -10,6 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tursoraft_raft::{
     Client, ClusterConfig, CountingStats, DelayTable, Error, LogConfig, NodeId, Proposed, Status,
 };
@@ -196,6 +197,21 @@ impl Drop for Cluster {
             let _ = child.wait();
         }
     }
+}
+
+/// The tests of one binary run at the same time, and their node processes
+/// share the CPUs and the disk. A test that compares times measured at
+/// different moments takes this lock with [`alone`], so that no other test
+/// starts or stops between its measurements; every other test takes it with
+/// [`shared`].
+static TIMING: RwLock<()> = RwLock::const_new(());
+
+pub async fn alone() -> RwLockWriteGuard<'static, ()> {
+    TIMING.write().await
+}
+
+pub async fn shared() -> RwLockReadGuard<'static, ()> {
+    TIMING.read().await
 }
 
 /// Proposes `n` proposals one after another, and returns the time each took.

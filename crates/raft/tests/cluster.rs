@@ -25,6 +25,7 @@ fn proposals_of(record: &Option<Vec<(u64, Vec<u8>)>>) -> BTreeSet<Vec<u8>> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn three_nodes_elect_replicate_and_apply_in_the_same_order() {
+    let _lock = common::shared().await;
     let mut c = Cluster::new(&[1, 2, 3], &["--record"], |_| {});
     c.start_all();
     let leader = c.initialize(&[1, 2, 3]).await;
@@ -63,6 +64,7 @@ async fn futures_join(c: &Cluster, ids: &[NodeId]) -> Vec<tursoraft_raft::Counti
 
 #[tokio::test(flavor = "multi_thread")]
 async fn leader_killed_with_sigkill_loses_no_acknowledged_proposal_and_rejoins_from_disk() {
+    let _lock = common::shared().await;
     let mut c = Cluster::new(&[1, 2, 3], &["--record"], |cfg| {
         cfg.batching = Some(Batching::default());
     });
@@ -176,6 +178,7 @@ async fn leader_killed_with_sigkill_loses_no_acknowledged_proposal_and_rejoins_f
 /// change.
 #[tokio::test(flavor = "multi_thread")]
 async fn stopped_non_voting_follower_does_not_slow_writes() {
+    let _lock = common::alone().await;
     let mut c = Cluster::new(&[1, 2, 3, 4], &["--record"], |cfg| {
         cfg.delays = DelayTable::uniform(10.0);
     });
@@ -209,8 +212,15 @@ async fn stopped_non_voting_follower_does_not_slow_writes() {
 /// The same with a follower that is 1 s away from every voter, and timeouts
 /// set for the voters alone. On openraft 0.9 this needed a heartbeat longer
 /// than 1 s; now the follower still receives every entry.
+///
+/// The writes measured with the far follower take about 3 s. The follower
+/// gets nothing in the first second after it was added, half a round trip
+/// for the leader's first request and half for the answer; then the leader
+/// sends it the entries it lacks and every new write. The test checks that
+/// the follower had stored writes of that window before the window ended.
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_non_voting_follower_does_not_slow_writes() {
+    let _lock = common::alone().await;
     let mut c = Cluster::new(&[1, 2, 3, 4], &["--record"], |cfg| {
         let far = |a| PairRtt {
             a,
@@ -229,13 +239,22 @@ async fn slow_non_voting_follower_does_not_slow_writes() {
     c.start_all();
     let leader = c.initialize(&[1, 2, 3]).await;
     let client = c.client(leader);
-    let near_only = sequential(&client, "before", 30).await;
-    c.client(leader).add_follower(4, c.addr(4)).await.unwrap();
-    let with_far = sequential(&client, "after", 30).await;
+    let near_only = sequential(&client, "before", 60).await;
+    let added = c.client(leader).add_follower(4, c.addr(4)).await.unwrap();
+    let with_far = sequential(&client, "after", 200).await;
+    let stored = c.status(4).await.last_log_index.unwrap_or(0);
     println!(
-        "median time to acknowledge: without the far follower {:.2} ms, with it {:.2} ms",
+        "median time to acknowledge: without the far follower {:.2} ms, with it {:.2} ms; \
+         when the last write was acknowledged, the far follower had stored {} of the {} \
+         writes made with it",
         ms(median(&near_only)),
-        ms(median(&with_far))
+        ms(median(&with_far)),
+        stored.saturating_sub(added),
+        with_far.len()
+    );
+    assert!(
+        stored > added,
+        "the far follower got no write of the measured window"
     );
     assert!(median(&with_far) < median(&near_only) + Duration::from_millis(3));
     let index = c.status(leader).await.last_log_index.unwrap();
@@ -255,6 +274,7 @@ async fn slow_non_voting_follower_does_not_slow_writes() {
 /// follower, back-to-back writes cost two round trips.)
 #[tokio::test(flavor = "multi_thread")]
 async fn delay_table_sets_round_trip_and_acknowledgement_time() {
+    let _lock = common::alone().await;
     for rtt_ms in [10.0, 100.0] {
         let mut c = Cluster::new(&[1, 2, 3], &[], |cfg| {
             cfg.delays = DelayTable::uniform(rtt_ms)
@@ -344,6 +364,7 @@ async fn delay_table_sets_round_trip_and_acknowledgement_time() {
 /// entries each carries. openraft 0.9 kept one in flight; 0.10 pipelines.
 #[tokio::test(flavor = "multi_thread")]
 async fn openraft_append_entries_in_flight_per_follower() {
+    let _lock = common::shared().await;
     let mut c = Cluster::new(&[1, 2, 3], &[], |cfg| {
         cfg.delays = DelayTable::uniform(100.0)
     });
@@ -382,6 +403,7 @@ async fn openraft_append_entries_in_flight_per_follower() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn batching_puts_concurrent_proposals_in_fewer_entries_and_answers_each_caller() {
+    let _lock = common::shared().await;
     for batching in [true, false] {
         let mut c = Cluster::new(&[1, 2, 3], &["--reject-prefix", "reject"], |cfg| {
             cfg.delays = DelayTable::uniform(10.0);
@@ -434,6 +456,7 @@ async fn batching_puts_concurrent_proposals_in_fewer_entries_and_answers_each_ca
 
 #[tokio::test(flavor = "multi_thread")]
 async fn node_joining_after_compaction_gets_a_snapshot_then_later_entries() {
+    let _lock = common::shared().await;
     let mut c = Cluster::new(&[1, 2, 3, 4], &["--record"], |cfg| {
         cfg.log = LogConfig {
             snapshot_every: 20,
@@ -490,6 +513,7 @@ async fn node_joining_after_compaction_gets_a_snapshot_then_later_entries() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn proposal_made_on_a_follower_takes_effect() {
+    let _lock = common::shared().await;
     let mut c = Cluster::new(&[1, 2, 3], &["--record"], |cfg| {
         cfg.delays = DelayTable::uniform(10.0)
     });
@@ -533,6 +557,7 @@ async fn proposal_made_on_a_follower_takes_effect() {
 /// and no acknowledged proposal is lost.
 #[tokio::test(flavor = "multi_thread")]
 async fn transfer_leader_moves_leadership_without_losing_writes() {
+    let _lock = common::shared().await;
     for rtt_ms in [0.0, 100.0] {
         let mut c = Cluster::new(&[1, 2, 3], &["--record"], |cfg| {
             cfg.delays = DelayTable::uniform(rtt_ms);
@@ -619,6 +644,7 @@ async fn transfer_leader_moves_leadership_without_losing_writes() {
 /// check, `lost` votes for `behind`, which leads without those proposals.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_voter_that_lost_its_directory_cannot_take_part_as_that_voter() {
+    let _lock = common::shared().await;
     let mut c = Cluster::new(&[1, 2, 3], &["--record"], |_| {});
     c.start_all();
     let leader = c.initialize(&[1, 2, 3]).await;

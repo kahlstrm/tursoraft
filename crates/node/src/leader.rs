@@ -21,6 +21,18 @@
 //! Before it captures a group, the pipelined loop waits until this node has
 //! applied the entries already committed; see [`wait_for_apply`].
 //!
+//! Change sets that other nodes captured in local transactions
+//! ([`Work::ChangeSet`]) join the next group. With pipelining, the loop
+//! first checks them on the ahead file, as apply would, and keeps the effect
+//! of each that passes there, so the captures after it see it. One that
+//! fails there is answered as rejected and never proposed. They read
+//! committed state only, so they need no `reads_pending`: apply checks their
+//! rows against the node's file, which holds exactly that state plus what
+//! came after. They go into the entry before the group's captured change
+//! sets, in the order they were put into the ahead file. Without
+//! pipelining they are not checked by the loop and go after the captured
+//! ones, which were captured without them.
+//!
 //! The node's own file changes only by applying committed entries, in both
 //! modes.
 
@@ -34,6 +46,7 @@ use openraft::error::ClientWriteError;
 use openraft::impls::ProgressResponder;
 use openraft::raft::ClientWriteResult;
 use openraft::ReadPolicy;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tursoraft_changeset::{AheadDb, Captured, ChangeSet};
 use tursoraft_raft::{Outcome, Proposals, TypeConfig};
@@ -46,9 +59,18 @@ const MAX_GROUP: usize = 1024;
 type LeaderId = CommittedLeaderIdOf<TypeConfig>;
 
 pub(crate) struct Job {
-    pub statements: Vec<Statement>,
+    pub work: Work,
     pub mode: CommitMode,
     pub reply: oneshot::Sender<Result<Written, Error>>,
+}
+
+/// What a transaction brings to the leader.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum Work {
+    /// Statements for the leader to run.
+    Statements(Vec<Statement>),
+    /// The change set of a local transaction that ran on another node.
+    ChangeSet(Vec<u8>),
 }
 
 /// A captured transaction waiting for its entry.
@@ -56,6 +78,8 @@ struct Waiting {
     mode: CommitMode,
     reply: Option<oneshot::Sender<Result<Written, Error>>>,
     results: Vec<Rows>,
+    /// The change set came from a local transaction on some node.
+    incoming: bool,
 }
 
 /// A transaction that changed nothing.
@@ -168,37 +192,18 @@ impl Pipeline {
             }
         }
 
-        let transactions: Vec<Vec<_>> = jobs
-            .iter()
-            .map(|j| j.statements.iter().map(Statement::to_changeset).collect())
-            .collect();
-        let main = node.db.clone();
-        let ahead = self.ahead.clone();
-        let started = Instant::now();
-        let captured = tokio::task::spawn_blocking(move || match ahead {
-            Some(ahead) => ahead.capture_batch(&transactions),
-            None => main.capture_batch(&transactions),
-        })
-        .await
-        .expect("capture does not panic");
-        node.counters
-            .capture_micros
-            .fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-        node.counters
-            .captured_transactions
-            .fetch_add(jobs.len() as u64, Relaxed);
-        let captured = match captured {
-            Ok(c) => c,
-            Err(e) => {
-                // A batch that fails as a whole leaves the ahead file as it was.
-                return fail_all(jobs, Error::Unavailable(format!("capture failed: {e}")));
-            }
-        };
-
+        let (incoming, jobs): (Vec<Job>, Vec<Job>) = jobs
+            .into_iter()
+            .partition(|j| matches!(j.work, Work::ChangeSet(_)));
         let mut proposals = Vec::new();
         let mut waiting = Vec::new();
+        let unchecked = self
+            .check_incoming(node, incoming, &mut proposals, &mut waiting)
+            .await;
+        let captured = self.capture(node, jobs).await;
+
         let mut read_only = Vec::new();
-        for (job, captured) in jobs.into_iter().zip(captured) {
+        for (job, captured) in captured {
             let Captured {
                 results,
                 change_set,
@@ -232,7 +237,12 @@ impl Pipeline {
                 mode: job.mode,
                 reply: Some(job.reply),
                 results,
+                incoming: false,
             });
+        }
+        for (change_set, w) in unchecked {
+            proposals.push(change_set);
+            waiting.push(w);
         }
 
         if !proposals.is_empty() {
@@ -278,6 +288,116 @@ impl Pipeline {
                         r,
                     ));
                 }
+            }
+        }
+    }
+
+    /// With pipelining, applies the incoming change sets to the ahead file,
+    /// adds those that pass to `proposals` and `waiting`, and answers the
+    /// others as rejected. Without, returns them all unchecked.
+    async fn check_incoming(
+        &self,
+        node: &Inner,
+        incoming: Vec<Job>,
+        proposals: &mut Vec<Vec<u8>>,
+        waiting: &mut Vec<Waiting>,
+    ) -> Vec<(Vec<u8>, Waiting)> {
+        let mut jobs = Vec::with_capacity(incoming.len());
+        for job in incoming {
+            let Work::ChangeSet(change_set) = job.work else {
+                unreachable!("only change sets come in")
+            };
+            let w = Waiting {
+                mode: job.mode,
+                reply: Some(job.reply),
+                results: Vec::new(),
+                incoming: true,
+            };
+            jobs.push((change_set, w));
+        }
+        node.counters.incoming.fetch_add(jobs.len() as u64, Relaxed);
+        let Some(ahead) = self.ahead.clone() else {
+            return jobs;
+        };
+        if jobs.is_empty() {
+            return jobs;
+        }
+        let change_sets: Vec<Vec<u8>> = jobs.iter().map(|(c, _)| c.clone()).collect();
+        let started = Instant::now();
+        let outcomes = tokio::task::spawn_blocking(move || ahead.apply_incoming(&change_sets))
+            .await
+            .expect("apply does not panic");
+        node.counters
+            .incoming_micros
+            .fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        let outcomes = match outcomes {
+            Ok(o) => o,
+            Err(e) => {
+                // The ahead file is as it was; nothing was proposed.
+                for (_, w) in jobs {
+                    let reply = w.reply.expect("not answered yet");
+                    let _ = reply.send(Err(Error::Unavailable(format!("check failed: {e}"))));
+                }
+                return Vec::new();
+            }
+        };
+        for ((change_set, w), outcome) in jobs.into_iter().zip(outcomes) {
+            match outcome {
+                Outcome::Applied => {
+                    proposals.push(change_set);
+                    waiting.push(w);
+                }
+                Outcome::Rejected { reason } => {
+                    node.counters.incoming_rejected_early.fetch_add(1, Relaxed);
+                    let reply = w.reply.expect("not answered yet");
+                    let _ = reply.send(Err(Error::Rejected(reason)));
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// Captures the statement jobs on the ahead file, or on the node's file
+    /// without pipelining. A batch that fails as a whole fails its jobs and
+    /// leaves the ahead file as it was.
+    async fn capture(
+        &self,
+        node: &Inner,
+        jobs: Vec<Job>,
+    ) -> Vec<(Job, Result<Captured, tursoraft_changeset::Error>)> {
+        if jobs.is_empty() {
+            return Vec::new();
+        }
+        let transactions: Vec<Vec<_>> = jobs
+            .iter()
+            .map(|j| match &j.work {
+                Work::Statements(s) => s.iter().map(Statement::to_changeset).collect(),
+                Work::ChangeSet(_) => unreachable!("only statements are captured"),
+            })
+            .collect();
+        let main = node.db.clone();
+        let ahead = self.ahead.clone();
+        let started = Instant::now();
+        let captured = tokio::task::spawn_blocking(move || match ahead {
+            Some(ahead) => ahead.capture_batch(&transactions),
+            None => main.capture_batch(&transactions),
+        })
+        .await
+        .expect("capture does not panic");
+        node.counters
+            .capture_micros
+            .fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        node.counters
+            .captured_transactions
+            .fetch_add(jobs.len() as u64, Relaxed);
+        match captured {
+            Ok(c) => jobs.into_iter().zip(c).collect(),
+            Err(e) => {
+                for job in jobs {
+                    let e = Error::Unavailable(format!("capture failed: {e}"));
+                    let _ = job.reply.send(Err(e));
+                }
+                Vec::new()
             }
         }
     }
@@ -516,6 +636,9 @@ fn finish(
             Outcome::Rejected { reason } => {
                 all_applied = false;
                 node.counters.rejected.fetch_add(1, Relaxed);
+                if w.incoming {
+                    node.counters.incoming_rejected_late.fetch_add(1, Relaxed);
+                }
                 Err(Error::Rejected(reason))
             }
         };

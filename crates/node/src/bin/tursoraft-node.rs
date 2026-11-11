@@ -1,11 +1,12 @@
 //! One tursoraft node in its own process.
 //!
 //! ```text
-//! tursoraft-node --config cluster.json --id 1 --dir /tmp/n1 [--max-pending-groups N]
+//! tursoraft-node --config cluster.json --id 1 --dir /tmp/n1 [--max-pending-groups N] [--local-hold-ms MS]
 //! ```
 //!
 //! `--max-pending-groups` sets [`tursoraft_node::Options::max_pending_groups`]
-//! (default 256); 1 turns pipelining off.
+//! (default 256); 1 turns pipelining off. `--local-hold-ms` sets
+//! [`tursoraft_node::Options::local_hold_ms`] (default 1000).
 //!
 //! `cluster.json` is a [`tursoraft_raft::ClusterConfig`]. The node keeps its
 //! Raft log in `DIR/raft` and its database in `DIR/data.db`, and prints
@@ -44,6 +45,11 @@ async fn main() {
                 )
             }
             "--dir" => dir = Some(PathBuf::from(value())),
+            "--local-hold-ms" => {
+                options.local_hold_ms = value()
+                    .parse()
+                    .unwrap_or_else(|_| usage("--local-hold-ms must be a number"))
+            }
             "--max-pending-groups" => {
                 options.max_pending_groups =
                     value().parse().ok().filter(|n| *n >= 1).unwrap_or_else(|| {
@@ -74,6 +80,6 @@ async fn main() {
 
 fn usage(msg: &str) -> ! {
     eprintln!("{msg}");
-    eprintln!("usage: tursoraft-node --config FILE --id N --dir DIR [--max-pending-groups N]");
+    eprintln!("usage: tursoraft-node --config FILE --id N --dir DIR [--max-pending-groups N] [--local-hold-ms MS]");
     std::process::exit(2);
 }

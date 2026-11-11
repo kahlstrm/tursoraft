@@ -14,6 +14,11 @@
 //! module. Either way, every capture sees every earlier change set, and no
 //! node writes its database file except by applying a committed entry.
 //!
+//! Interactive transactions ([`Node::begin`]) run on the node that starts
+//! them, one statement at a time, on its own file with change capture; see
+//! [`Transaction`]. At commit the node sends the leader one message, the
+//! change set, and the leader proposes it in its next group.
+//!
 //! Reads ([`Node::query`]) run one `SELECT` on this node's file, at the
 //! [`ReadLevel`] the caller asks for.
 //!
@@ -23,6 +28,7 @@ mod client;
 mod leader;
 mod measured;
 mod reads;
+mod transaction;
 
 use std::path::Path;
 use std::sync::{Arc, Weak};
@@ -37,6 +43,7 @@ use tursoraft_raft::NodeConfig;
 
 pub use client::Client;
 pub use measured::Stats;
+pub use transaction::{ClientTransaction, Transaction};
 
 /// One node. Cloning gives another handle to the same node.
 #[derive(Clone)]
@@ -54,6 +61,8 @@ struct Inner {
     /// How long a write waits for a leader, and a read for a log position.
     timeout: Duration,
     options: Options,
+    /// Interactive transactions that [`Client`]s opened on this node.
+    open: transaction::Open,
 }
 
 /// Settings of one node that the cluster configuration does not hold.
@@ -65,12 +74,17 @@ pub struct Options {
     /// second database file next to the node's own (`<name>.ahead.db` for
     /// `<name>.db`) to capture on.
     pub max_pending_groups: usize,
+    /// How long an interactive transaction on this node may hold the write
+    /// lock of its file while an apply, or another interactive transaction,
+    /// waits for it, in milliseconds. It then ends with [`Error::Aborted`].
+    pub local_hold_ms: u64,
 }
 
 impl Default for Options {
     fn default() -> Options {
         Options {
             max_pending_groups: 256,
+            local_hold_ms: 1000,
         }
     }
 }
@@ -180,6 +194,12 @@ pub enum Error {
     /// leader, in time.
     #[error("read timed out: {0}")]
     ReadTimeout(String),
+    /// An interactive transaction ended before its commit was sent: it held
+    /// its node's write lock too long while others waited, a statement such
+    /// as `INSERT OR ROLLBACK` ended it, or it could not begin in time. It
+    /// had no effect; running it again is safe.
+    #[error("aborted: {0}")]
+    Aborted(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -207,6 +227,7 @@ impl Node {
         );
         let db_path = db_path.as_ref();
         let db = NodeDb::open(db_path).map_err(|e| Error::Internal(e.to_string()))?;
+        db.set_local_hold_limit(Duration::from_millis(options.local_hold_ms));
         let ahead = if options.max_pending_groups > 1 {
             let path = db_path.with_extension("ahead.db");
             Some(AheadDb::open(path).map_err(|e| Error::Internal(e.to_string()))?)
@@ -230,6 +251,7 @@ impl Node {
                 counters,
                 timeout,
                 options: options.clone(),
+                open: Default::default(),
             }),
         };
         tokio::spawn(leader::run(
@@ -291,12 +313,19 @@ impl Node {
         statements: Vec<Statement>,
         mode: CommitMode,
     ) -> Result<Written, Error> {
+        self.on_leader(leader::Work::Statements(statements), mode)
+            .await
+    }
+
+    /// Hands `work` to the leader's loop, here or on the leader, and
+    /// returns its answer at the time `mode` sets.
+    async fn on_leader(&self, work: leader::Work, mode: CommitMode) -> Result<Written, Error> {
         let deadline = Instant::now() + self.inner.timeout;
         loop {
             let res = match self.wait_leader(deadline).await {
                 None => return Err(Error::Unavailable("no leader is known".into())),
-                Some(leader) if leader == self.id() => self.lead(statements.clone(), mode).await,
-                Some(leader) => self.forward(leader, &statements, mode).await,
+                Some(leader) if leader == self.id() => self.lead(work.clone(), mode).await,
+                Some(leader) => self.forward(leader, &work, mode).await,
             };
             match res {
                 // Nothing was captured or proposed, so trying again is safe.
@@ -344,15 +373,11 @@ impl Node {
     }
 
     /// Hands the transaction to this node's leader loop.
-    async fn lead(&self, statements: Vec<Statement>, mode: CommitMode) -> Result<Written, Error> {
+    async fn lead(&self, work: leader::Work, mode: CommitMode) -> Result<Written, Error> {
         let (reply, rx) = oneshot::channel();
         self.inner
             .queue
-            .send(leader::Job {
-                statements,
-                mode,
-                reply,
-            })
+            .send(leader::Job { work, mode, reply })
             .map_err(|_| Error::Unavailable("the leader loop has stopped".into()))?;
         rx.await
             .map_err(|_| Error::OutcomeUnknown("the leader loop dropped the transaction".into()))?
@@ -362,12 +387,12 @@ impl Node {
     async fn forward(
         &self,
         leader: u64,
-        statements: &[Statement],
+        work: &leader::Work,
         mode: CommitMode,
     ) -> Result<Written, Error> {
         use tursoraft_raft::Error as R;
         let request = client::encode(&client::Request::Lead {
-            statements: statements.to_vec(),
+            work: work.clone(),
             mode,
         });
         // The leader may hold the transaction for up to its own timeout

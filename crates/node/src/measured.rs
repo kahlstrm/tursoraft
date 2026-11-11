@@ -26,6 +26,18 @@ pub struct Stats {
     /// handed to Raft, because another entry was appended at the same time.
     /// Their async transactions are acknowledged when applied.
     pub unknown_indexes: u64,
+    /// Leader loop: change sets of local transactions from any node,
+    /// received; those rejected on the ahead file without being proposed;
+    /// and the time spent checking them there. Also those proposed and
+    /// then rejected at apply, which [`Stats::rejected`] includes.
+    pub incoming: u64,
+    pub incoming_rejected_early: u64,
+    pub incoming_rejected_late: u64,
+    pub incoming_micros: u64,
+    /// Local transactions begun on this node, and those that ended without
+    /// commit because they held the write lock too long or failed to begin.
+    pub local_begun: u64,
+    pub local_aborted: u64,
     /// Leader loop: log entries proposed, one per group.
     pub groups: u64,
     /// Leader loop: transactions proposed.
@@ -68,6 +80,12 @@ pub(crate) struct Counters {
     pub resets: AtomicU64,
     pub reset_micros: AtomicU64,
     pub unknown_indexes: AtomicU64,
+    pub incoming: AtomicU64,
+    pub incoming_rejected_early: AtomicU64,
+    pub incoming_rejected_late: AtomicU64,
+    pub incoming_micros: AtomicU64,
+    pub local_begun: AtomicU64,
+    pub local_aborted: AtomicU64,
     applied_entries: AtomicU64,
     applied_change_sets: AtomicU64,
     apply_micros: AtomicU64,
@@ -86,6 +104,12 @@ impl Counters {
             resets: get(&self.resets),
             reset_micros: get(&self.reset_micros),
             unknown_indexes: get(&self.unknown_indexes),
+            incoming: get(&self.incoming),
+            incoming_rejected_early: get(&self.incoming_rejected_early),
+            incoming_rejected_late: get(&self.incoming_rejected_late),
+            incoming_micros: get(&self.incoming_micros),
+            local_begun: get(&self.local_begun),
+            local_aborted: get(&self.local_aborted),
             groups: get(&self.groups),
             transactions: get(&self.transactions),
             failed: get(&self.failed),

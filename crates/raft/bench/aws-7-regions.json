@@ -1,0 +1,75 @@
+{
+ "metadata": {
+  "percentile": "p_50",
+  "timeframe": "1D",
+  "unit": "milliseconds"
+ },
+ "data": {
+  "eu-central-1": {
+   "eu-central-1": 1.4819999999999998,
+   "eu-west-1": 21.564,
+   "eu-west-2": 14.522,
+   "us-east-1": 90.03800000000001,
+   "us-west-2": 148.46699999999998,
+   "ap-southeast-1": 166.65300000000002,
+   "ap-southeast-2": 258.48900000000003
+  },
+  "eu-west-1": {
+   "eu-central-1": 21.652,
+   "eu-west-1": 1.554,
+   "eu-west-2": 12.399000000000001,
+   "us-east-1": 68.844,
+   "us-west-2": 124.478,
+   "ap-southeast-1": 175.31799999999998,
+   "ap-southeast-2": 255.13600000000002
+  },
+  "eu-west-2": {
+   "eu-central-1": 14.205000000000002,
+   "eu-west-1": 10.891,
+   "eu-west-2": 1.7159999999999997,
+   "us-east-1": 76.524,
+   "us-west-2": 138.851,
+   "ap-southeast-1": 164.08300000000003,
+   "ap-southeast-2": 266.346
+  },
+  "us-east-1": {
+   "eu-central-1": 92.875,
+   "eu-west-1": 68.293,
+   "eu-west-2": 78.009,
+   "us-east-1": 1.3450000000000002,
+   "us-west-2": 66.037,
+   "ap-southeast-1": 219.49200000000002,
+   "ap-southeast-2": 211.08599999999998
+  },
+  "us-west-2": {
+   "eu-central-1": 144.168,
+   "eu-west-1": 119.096,
+   "eu-west-2": 129.63899999999998,
+   "us-east-1": 62.098,
+   "us-west-2": 6.758000000000001,
+   "ap-southeast-1": 174.388,
+   "ap-southeast-2": 142.657
+  },
+  "ap-southeast-1": {
+   "eu-central-1": 162.973,
+   "eu-west-1": 178.08700000000002,
+   "eu-west-2": 164.161,
+   "us-east-1": 220.84,
+   "us-west-2": 181.18200000000002,
+   "ap-southeast-1": 1.149,
+   "ap-southeast-2": 94.092
+  },
+  "ap-southeast-2": {
+   "eu-central-1": 252.997,
+   "eu-west-1": 254.909,
+   "eu-west-2": 265.649,
+   "us-east-1": 203.889,
+   "us-west-2": 147.038,
+   "ap-southeast-1": 94.00399999999999,
+   "ap-southeast-2": 1.134
+  }
+ },
+ "source": "https://www.cloudping.co/ (initialData embedded in the page: AWS inter-region round trip, percentile p_50, timeframe 1D)",
+ "fetched_at": "2026-11-11T16:40:44Z",
+ "note": "data[a][b] as published; the benchmark uses the mean of data[a][b] and data[b][a] for the pair."
+}

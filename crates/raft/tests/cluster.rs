@@ -547,6 +547,11 @@ async fn transfer_leader_moves_leadership_without_losing_writes() {
         let called = Instant::now();
         c.client(old).transfer_leader(target).await.unwrap();
         let seen = called.elapsed();
+        // The writers above are still waiting for proposals made during the
+        // transfer, so time a new one issued now.
+        let fresh = c.client(old).propose(b"fresh".to_vec()).await.unwrap();
+        assert_eq!(fresh.outcome, Outcome::Applied);
+        let fresh_acked = called.elapsed();
         tokio::time::sleep(Duration::from_secs(1)).await;
         stop.store(true, Ordering::Relaxed);
         for w in writers {
@@ -555,12 +560,6 @@ async fn transfer_leader_moves_leadership_without_losing_writes() {
         assert_eq!(c.wait_leader(&[1, 2, 3]).await, target);
 
         let acked = acked.lock().unwrap().clone();
-        let first_after = acked
-            .iter()
-            .filter(|(sent, _, _)| *sent >= called + seen)
-            .map(|(_, a, _)| *a - called)
-            .min()
-            .unwrap();
         let mut ack_times: Vec<Instant> = acked.iter().map(|(_, a, _)| *a).collect();
         ack_times.sort();
         let stall = ack_times
@@ -570,15 +569,16 @@ async fn transfer_leader_moves_leadership_without_losing_writes() {
             .max()
             .unwrap();
         println!(
-            "transfer {old}->{target} at {rtt_ms} ms: new leader seen after {:.1} ms; first \
-             acknowledgement of a write sent after that came {:.1} ms after the call; longest \
+            "transfer {old}->{target} at {rtt_ms} ms: new leader seen after {:.1} ms; a write \
+             issued at the old leader then was acknowledged {:.1} ms after the call; longest \
              gap between acknowledgements {:.1} ms; {} proposals acknowledged",
             ms(seen),
-            ms(first_after),
+            ms(fresh_acked),
             ms(stall),
             acked.len()
         );
-        let acked: BTreeSet<Vec<u8>> = acked.into_iter().map(|(_, _, p)| p).collect();
+        let mut acked: BTreeSet<Vec<u8>> = acked.into_iter().map(|(_, _, p)| p).collect();
+        acked.insert(b"fresh".to_vec());
         let index = c.converge(target, &[1, 2, 3]).await;
         for id in [1, 2, 3] {
             let s = c.stats(id).await;

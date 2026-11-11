@@ -16,6 +16,20 @@ Turso comes from the enclosing checkout as path dependencies (commit
 not a member of Turso's workspace. It uses resolver 3, so the lockfile only
 picks dependency versions that support Rust 1.88.
 
+## Build
+
+This repository holds only the `tursoraft/` directory, so it builds inside a
+Turso checkout at the pinned commit:
+
+```bash
+git clone https://github.com/tursodatabase/turso
+cd turso
+git checkout 0c9fe0dd94c14a4f00106bffa9c9433d5965fd3a
+git clone https://github.com/kahlstrm/tursoraft
+cd tursoraft
+cargo test --workspace
+```
+
 `cargo test -p tursoraft-changeset -- --nocapture --test-threads=1` prints
 what CDC captures (`tests/cdc_capture.rs`) and replays a leader's change sets
 onto another database with the sync engine's `DatabaseReplaySession`

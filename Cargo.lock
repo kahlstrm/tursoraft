@@ -2824,6 +2824,7 @@ dependencies = [
  "tracing-subscriber",
  "tursoraft-node",
  "tursoraft-raft",
+ "tursoraft-relay",
 ]
 
 [[package]]

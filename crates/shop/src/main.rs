@@ -2,6 +2,7 @@
 //! tursoraft-shop serve --config cluster.json --id N --dir DIR --http ADDR --admin ADDR
 //!                      [--name NAME] [--cart-mode async|quorum] [--payment-ms LO,HI]
 //!                      [--decline P] [--local-hold-ms MS] [--break ack-rejected|oversell]
+//!                      [--relay URL --relay-secret-file FILE]
 //! tursoraft-shop load  --url URL --name NAME --out FILE [--duration S] [--shoppers N]
 //!                      [--think-ms MS] [--flash-at S] [--flash-shoppers N]
 //! tursoraft-shop check --admin URL [--admin URL ...] RESULTS.json ...
@@ -11,6 +12,13 @@
 //! the cluster config gives node N), the shop on `--http`, and the admin API
 //! on `--admin`. `cluster.json` is a [`tursoraft_raft::ClusterConfig`]. The
 //! node keeps its Raft log in `DIR/raft` and its database in `DIR/data.db`.
+//!
+//! `--relay` also runs a relay ([`tursoraft_relay`]) in the instance: it sends
+//! the changes this node applies to a reads-only follower Durable Object, at
+//! the Worker URL `URL` (`wss://HOST/relay?follower=NAME`, see `edge/`).
+//! The relay's secret is read from `FILE`, never from the command line, so
+//! that it does not show in the process list or a service's unit file. Run
+//! one relay per follower name: a second one takes the follower over.
 //!
 //! `load` drives one instance's HTTP API and writes what every write request
 //! was told to `--out`. `check` reads every node's data through the admin API,
@@ -64,6 +72,8 @@ async fn serve(args: &[String]) {
     let mut decline = 0.05;
     let mut options = tursoraft_node::Options::default();
     let mut breaks = tursoraft_shop::store::Breaks::default();
+    let mut relay_url = None;
+    let mut relay_secret_file = None;
     for (arg, value) in pairs(args) {
         match arg {
             "--config" => config_path = Some(PathBuf::from(value)),
@@ -87,6 +97,8 @@ async fn serve(args: &[String]) {
             }
             "--decline" => decline = number(arg, value),
             "--local-hold-ms" => options.local_hold_ms = number(arg, value),
+            "--relay" => relay_url = Some(value.to_string()),
+            "--relay-secret-file" => relay_secret_file = Some(PathBuf::from(value)),
             "--break" => match value {
                 "ack-rejected" => breaks.ack_rejected = true,
                 "oversell" => breaks.oversell = true,
@@ -100,6 +112,11 @@ async fn serve(args: &[String]) {
     let dir = dir.unwrap_or_else(|| usage("--dir is required"));
     let http = http.unwrap_or_else(|| usage("--http is required"));
     let admin = admin.unwrap_or_else(|| usage("--admin is required"));
+    let relay = match (relay_url, relay_secret_file) {
+        (Some(url), Some(file)) => Some(tursoraft_relay::Config::new(url, read_secret(&file))),
+        (None, None) => None,
+        _ => usage("--relay and --relay-secret-file go together"),
+    };
 
     let text = std::fs::read_to_string(&config_path).expect("read the cluster config");
     let cluster: ClusterConfig = serde_json::from_str(&text).expect("parse the cluster config");
@@ -116,6 +133,11 @@ async fn serve(args: &[String]) {
     store.decline = decline;
     store.breaks = breaks;
     let app = Arc::new(App { store, cluster });
+    // Runs until this function returns.
+    let _relay = relay.map(|config| {
+        tracing::info!("relaying this node's changes to {}", config.url);
+        tursoraft_relay::Relay::start(node.clone(), config)
+    });
 
     let http = tokio::net::TcpListener::bind(&http)
         .await
@@ -193,6 +215,18 @@ async fn check_main(args: &[String]) -> bool {
     report.violations.is_empty()
 }
 
+/// The relay's secret: the whole file, without trailing white space. An
+/// error names the file, never its contents.
+fn read_secret(file: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(file)
+        .unwrap_or_else(|e| usage(&format!("read --relay-secret-file {}: {e}", file.display())));
+    let secret = text.trim_end().to_string();
+    if secret.is_empty() {
+        usage(&format!("--relay-secret-file {} is empty", file.display()));
+    }
+    secret
+}
+
 fn pairs(args: &[String]) -> impl Iterator<Item = (&str, &str)> {
     args.chunks(2).map(|c| match c {
         [arg, value] => (arg.as_str(), value.as_str()),
@@ -212,7 +246,8 @@ fn usage(msg: &str) -> ! {
     eprintln!(
         "usage: tursoraft-shop serve --config FILE --id N --dir DIR --http ADDR --admin ADDR \
          [--name NAME] [--cart-mode async|quorum] [--payment-ms LO,HI] [--decline P] \
-         [--local-hold-ms MS] [--break ack-rejected|oversell]"
+         [--local-hold-ms MS] [--break ack-rejected|oversell] \
+         [--relay URL --relay-secret-file FILE]"
     );
     eprintln!(
         "       tursoraft-shop load --url URL --name NAME --out FILE [--duration S] [--shoppers N] \

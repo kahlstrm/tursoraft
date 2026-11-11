@@ -2,7 +2,7 @@
 
 Research prototype: every application instance embeds a Turso database and a
 Raft node. The cluster replicates the rows each transaction changed, read from
-Turso's change data capture (CDC), through Raft (openraft 0.9.25).
+Turso's change data capture (CDC), through Raft (openraft 0.10.0).
 
 | Crate | Path | Role |
 |---|---|---|

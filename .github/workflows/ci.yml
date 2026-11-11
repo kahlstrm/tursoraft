@@ -22,6 +22,30 @@ jobs:
       - run: shellcheck deploy/*.sh
       # Print the machine the tests ran on, to read timing failures against.
       - run: nproc && free -m
+      # The relay's end-to-end tests run the Worker in edge/ under Miniflare.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: edge/package-lock.json
+      - run: npm ci
+        working-directory: edge
       # --no-fail-fast: one run reports every failing test, not only those
       # of the first test binary that fails.
       - run: cargo test --workspace --no-fail-fast
+
+  edge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: edge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: edge/package-lock.json
+      - run: npm ci
+      - run: npm test

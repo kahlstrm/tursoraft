@@ -522,8 +522,11 @@ async fn proposal_made_on_a_follower_takes_effect() {
     );
     assert!(read >= p.index);
     assert_eq!(c.status(follower).await.leader, Some(leader));
-    let err = c.client(follower).add_follower(9, "127.0.0.1:1").await;
-    assert!(err.is_ok(), "membership changes are forwarded too: {err:?}");
+    let res = c
+        .client(follower)
+        .change_voters([1, 2, 3].into_iter().collect())
+        .await;
+    assert!(res.is_ok(), "membership changes are forwarded too: {res:?}");
 }
 
 /// `transfer_leader` hands leadership to a chosen voter while writers run,
@@ -606,4 +609,67 @@ async fn transfer_leader_moves_leadership_without_losing_writes() {
             );
         }
     }
+}
+
+/// A voter that lost its directory and starts again under its id is refused
+/// by the other nodes, so it cannot vote for a voter whose log lacks
+/// acknowledged proposals. Voter `behind` is killed while the other two
+/// acknowledge proposals; then those two are killed, `lost` starts again with
+/// an empty directory, and `behind` starts again from its own. Without the
+/// check, `lost` votes for `behind`, which leads without those proposals.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voter_that_lost_its_directory_cannot_take_part_as_that_voter() {
+    let mut c = Cluster::new(&[1, 2, 3], &["--record"], |_| {});
+    c.start_all();
+    let leader = c.initialize(&[1, 2, 3]).await;
+    let others: Vec<NodeId> = [1, 2, 3].into_iter().filter(|id| *id != leader).collect();
+    let (lost, behind) = (others[0], others[1]);
+    c.kill(behind);
+    let mut acked = BTreeSet::new();
+    for n in 0..20 {
+        let p = format!("while {behind} was down {n}").into_bytes();
+        c.client(leader).propose(p.clone()).await.unwrap();
+        acked.insert(p);
+    }
+    c.kill(leader);
+    c.kill(lost);
+    std::fs::remove_dir_all(c.node_dir(lost)).unwrap();
+    c.start(lost);
+    c.start(behind);
+
+    // An election takes well under a second with these timeouts.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for id in [lost, behind] {
+        let s = c.status(id).await;
+        assert_ne!(s.state, "Leader", "node {id} leads: {s:?}");
+    }
+    assert_eq!(c.status(lost).await.last_log_index, None);
+    let log = std::fs::read_to_string(c.dir.path().join(format!("node-{lost}.log"))).unwrap();
+    assert!(
+        log.contains("the directory was lost or replaced"),
+        "node {lost} logged no refusal: {log}"
+    );
+
+    // With the old leader back, a leader is elected that has every
+    // acknowledged proposal, and `lost` is still refused.
+    c.start(leader);
+    let new_leader = c.wait_leader(&[leader, behind]).await;
+    let p = c
+        .client(new_leader)
+        .propose(b"after".to_vec())
+        .await
+        .unwrap();
+    c.wait_applied(&[leader, behind], p.index).await;
+    for id in [leader, behind] {
+        let applied = proposals_of(&c.stats(id).await.record);
+        assert!(
+            acked.is_subset(&applied),
+            "node {id} lost acknowledged proposals"
+        );
+    }
+    assert_eq!(c.status(lost).await.last_log_index, None);
+    println!(
+        "node {lost} lost its directory; node {behind} was behind; node {new_leader} leads with all {} acknowledged proposals",
+        acked.len()
+    );
 }

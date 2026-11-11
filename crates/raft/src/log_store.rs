@@ -17,14 +17,17 @@
 //! Every entry after the purge point is also kept in memory, so readers never
 //! touch the files. The snapshot policy bounds how many that are.
 
+use std::collections::hash_map::RandomState;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::fs::{self, File, OpenOptions};
+use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::ops::RangeBounds;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
 use openraft::OptionalSend;
@@ -34,6 +37,7 @@ use tokio::sync::oneshot;
 use crate::{LogEntry, LogId, TypeConfig, Vote};
 
 const META_FILE: &str = "meta";
+const INCARNATION_FILE: &str = "incarnation";
 const RECORD_HEADER: usize = 8;
 
 /// The Raft log of one node. Cloning gives another handle to the same log.
@@ -546,6 +550,34 @@ fn write_meta(dir: &Path, meta: &Meta) -> io::Result<()> {
     file.sync_all()?;
     fs::rename(&tmp, dir.join(META_FILE))?;
     sync_dir(dir)
+}
+
+/// The incarnation of the node directory `dir`: a random number, not 0,
+/// written there when it is first asked for. A node that lost its directory
+/// comes back with another one.
+pub(crate) fn incarnation(dir: &Path) -> io::Result<u64> {
+    let path = dir.join(INCARNATION_FILE);
+    match fs::read_to_string(&path) {
+        Ok(text) => return text.trim().parse().map_err(invalid_data),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    hasher.write_u32(std::process::id());
+    let incarnation = hasher.finish().max(1);
+    let tmp = dir.join("incarnation.tmp");
+    let file = File::create(&tmp)?;
+    file.write_all_at(incarnation.to_string().as_bytes(), 0)?;
+    file.sync_all()?;
+    fs::rename(&tmp, &path)?;
+    sync_dir(dir)?;
+    Ok(incarnation)
 }
 
 fn sync_dir(dir: &Path) -> io::Result<()> {

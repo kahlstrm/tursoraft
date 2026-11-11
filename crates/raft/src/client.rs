@@ -18,7 +18,7 @@ impl Client {
     /// Connects on first use. Requests time out after 30 s.
     pub fn new(addr: impl Into<String>) -> Client {
         Client {
-            peer: Peer::new(addr.into(), None, Duration::ZERO),
+            peer: Peer::new(addr.into(), None, Duration::ZERO, 0),
             timeout: Duration::from_secs(30),
         }
     }

@@ -11,7 +11,7 @@ use std::time::Duration;
 use openraft::async_runtime::WatchReceiver;
 use openraft::error::{ChangeMembershipError, ClientWriteError, LinearizableReadError, RaftError};
 use openraft::storage::RaftStateMachine;
-use openraft::{BasicNode, ReadPolicy, SnapshotPolicy};
+use openraft::{ReadPolicy, SnapshotPolicy};
 use tokio::io::BufReader;
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream};
@@ -20,13 +20,13 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tursoraft_statemachine::{Outcome, StateMachine};
 
-use crate::log_store::LogStore;
+use crate::log_store::{self, LogStore};
 use crate::network::{
     delayed_writer, encode, read_frame, unexpected, DelayedSender, Hello, InboundStreams, LeaderOp,
-    Network, NetworkFactory, Reply, Request, Response,
+    Network, NetworkFactory, Peer, Reply, Request, Response,
 };
 use crate::state_machine::StateMachineAdaptor;
-use crate::{Batching, Error, NodeConfig, NodeId, Proposed, Raft, Status};
+use crate::{Batching, Error, Member, NodeConfig, NodeId, Proposed, Raft, Status};
 
 /// Answers application requests: [`Node::app_request`] from other nodes and
 /// [`crate::Client::app`] from clients. It gets this node, so it can propose
@@ -44,6 +44,8 @@ pub struct Node {
 
 struct Inner {
     id: NodeId,
+    /// The incarnation of this node's directory.
+    incarnation: u64,
     raft: Raft,
     network: Arc<Network>,
     config: NodeConfig,
@@ -72,6 +74,7 @@ impl Node {
         let listener = TcpListener::bind(&config.listen).await.map_err(io_err)?;
         let local_addr = listener.local_addr().map_err(io_err)?;
         let log = LogStore::open(&config.dir, config.log.segment_bytes).map_err(io_err)?;
+        let incarnation = log_store::incarnation(&config.dir).map_err(io_err)?;
         let last_log_index = log.last_index();
         let mut sm = StateMachineAdaptor::new(state_machine)
             .await
@@ -126,6 +129,7 @@ impl Node {
         let node = Node {
             inner: Arc::new(Inner {
                 id: config.id,
+                incarnation,
                 raft,
                 network,
                 config,
@@ -154,12 +158,14 @@ impl Node {
     }
 
     /// Forms a new cluster with these voters (id and listen address). Call it
-    /// on one node, once.
+    /// on one node, once. Every voter must be running: this node asks each
+    /// for the incarnation of its directory, which the membership records.
     pub async fn initialize(&self, voters: BTreeMap<NodeId, String>) -> Result<(), Error> {
-        let members: BTreeMap<NodeId, BasicNode> = voters
-            .into_iter()
-            .map(|(id, addr)| (id, BasicNode::new(addr)))
-            .collect();
+        let mut members = BTreeMap::new();
+        for (id, addr) in voters {
+            let incarnation = self.identify(id, &addr).await?;
+            members.insert(id, Member { addr, incarnation });
+        }
         self.inner.raft.initialize(members).await.map_err(raft_err)
     }
 
@@ -207,10 +213,10 @@ impl Node {
         if to == self.inner.id {
             return self.call_app_handler(request).await;
         }
-        let addr = self
-            .addr_of(to)
+        let member = self
+            .member_of(to)
             .ok_or_else(|| Error::Raft(format!("node {to} is unknown")))?;
-        let peer = self.inner.network.peer(to, &addr);
+        let peer = self.inner.network.peer(to, &member);
         match peer.call(&Request::App(request), timeout).await? {
             Response::App(answer) => Ok(answer),
             other => Err(unexpected(other)),
@@ -252,7 +258,8 @@ impl Node {
     }
 
     /// Adds a non-voting follower (an openraft learner). Returns the log index
-    /// of the membership change. The leader never waits for it.
+    /// of the membership change. The leader never waits for it, but asks it
+    /// once for the incarnation of its directory, so it must be running.
     pub async fn add_follower(&self, id: NodeId, addr: String) -> Result<u64, Error> {
         self.run_for_index(LeaderOp::AddFollower { id, addr }).await
     }
@@ -292,10 +299,10 @@ impl Node {
     /// Measures the round trip to another node through the network layer,
     /// configured delay included.
     pub async fn ping(&self, peer: NodeId) -> Result<Duration, Error> {
-        let addr = self
-            .addr_of(peer)
+        let member = self
+            .member_of(peer)
             .ok_or_else(|| Error::Raft(format!("node {peer} is unknown")))?;
-        let peer = self.inner.network.peer(peer, &addr);
+        let peer = self.inner.network.peer(peer, &member);
         let start = Instant::now();
         peer.call(&Request::Ping, Duration::from_secs(10)).await?;
         Ok(start.elapsed())
@@ -358,9 +365,9 @@ impl Node {
             let res = if leader == self.inner.id {
                 self.run_at_leader(op.clone()).await
             } else {
-                match self.addr_of(leader) {
-                    Some(addr) => {
-                        let peer = self.inner.network.peer(leader, &addr);
+                match self.member_of(leader) {
+                    Some(member) => {
+                        let peer = self.inner.network.peer(leader, &member);
                         let left = deadline.saturating_duration_since(Instant::now());
                         peer.call(&Request::AtLeader(op.clone()), left).await
                     }
@@ -413,11 +420,20 @@ impl Node {
                 raft.trigger().transfer_leader(to).await.map_err(raft_err)?;
                 Ok(Response::Done)
             }
-            LeaderOp::AddFollower { id, addr } => raft
-                .add_learner(id, BasicNode::new(addr), false)
-                .await
-                .map(|r| Response::Index(r.log_id.index))
-                .map_err(client_write_err),
+            LeaderOp::AddFollower { id, addr } => {
+                let incarnation = self.identify(id, &addr).await?;
+                let known = self.member_of(id).map_or(0, |m| m.incarnation);
+                if known != 0 && known != incarnation {
+                    return Err(Error::Raft(format!(
+                        "node {id} is a member with incarnation {known}, but the node at {addr} has \
+                         incarnation {incarnation}: its directory was lost or replaced; add it under a new id"
+                    )));
+                }
+                raft.add_learner(id, Member { addr, incarnation }, false)
+                    .await
+                    .map(|r| Response::Index(r.log_id.index))
+                    .map_err(client_write_err)
+            }
             LeaderOp::ChangeVoters(voters) => raft
                 .change_membership(voters, true)
                 .await
@@ -468,14 +484,43 @@ impl Node {
         }
     }
 
-    fn addr_of(&self, id: NodeId) -> Option<String> {
+    /// Node `id` as the membership records it, or else with its address from
+    /// the configuration and an unknown incarnation.
+    fn member_of(&self, id: NodeId) -> Option<Member> {
         let m = self.inner.raft.metrics();
         let m = m.borrow_watched();
         m.membership_config
             .membership()
             .get_node(&id)
-            .map(|n| n.addr.clone())
-            .or_else(|| self.inner.config.peers.get(&id).cloned())
+            .cloned()
+            .or_else(|| {
+                let addr = self.inner.config.peers.get(&id)?.clone();
+                Some(Member {
+                    addr,
+                    incarnation: 0,
+                })
+            })
+    }
+
+    /// Asks the node at `addr` for the incarnation of its directory, and
+    /// checks that it is node `id`.
+    async fn identify(&self, id: NodeId, addr: &str) -> Result<u64, Error> {
+        if id == self.inner.id {
+            return Ok(self.inner.incarnation);
+        }
+        let delay = self.inner.config.delays.one_way(self.inner.id, id);
+        let peer = Peer::new(addr.to_string(), Some(self.inner.id), delay, 0);
+        let timeout = Duration::from_millis(self.inner.config.propose_timeout_ms);
+        match peer.call(&Request::Identify, timeout).await? {
+            Response::Identity {
+                id: found,
+                incarnation,
+            } if found == id => Ok(incarnation),
+            Response::Identity { id: found, .. } => Err(Error::Raft(format!(
+                "the node at {addr} is node {found}, not node {id}"
+            ))),
+            other => Err(unexpected(other)),
+        }
     }
 
     async fn handle(&self, req: Request) -> Reply {
@@ -520,6 +565,10 @@ impl Node {
                 .map(|()| Response::Done),
             Request::LinearizableRead => self.linearizable_read().await.map(Response::Index),
             Request::Ping => Ok(Response::Done),
+            Request::Identify => Ok(Response::Identity {
+                id: self.inner.id,
+                incarnation: self.inner.incarnation,
+            }),
             Request::PingPeer(peer) => self.ping(peer).await.map(|d| Response::Rtt {
                 micros: d.as_micros() as u64,
             }),
@@ -661,20 +710,46 @@ impl Node {
             self.inner.config.delays.one_way(self.inner.id, from)
         });
         let (out, writer) = delayed_writer(w, delay);
+        let refusal = (hello.to_incarnation != 0 && hello.to_incarnation != self.inner.incarnation)
+            .then(|| {
+                let from = hello
+                    .from
+                    .map_or("a node".to_string(), |f| format!("node {f}"));
+                let msg = format!(
+                    "{from} knows node {} as incarnation {}, but this node's directory {} has \
+                     incarnation {}: the directory was lost or replaced, so this node cannot take \
+                     part as node {}; requests from {from} are refused",
+                    self.inner.id,
+                    hello.to_incarnation,
+                    self.inner.config.dir.display(),
+                    self.inner.incarnation,
+                    self.inner.id,
+                );
+                tracing::error!("{msg}");
+                Error::Unreachable(msg)
+            });
         tokio::select! {
-            res = self.serve_requests(r, &out) => res,
+            res = self.serve_requests(r, &out, refusal) => res,
             res = writer => res,
         }
     }
 
+    /// Answers the requests of one connection, or answers each with
+    /// `refusal` if there is one.
     async fn serve_requests(
         &self,
         mut r: BufReader<OwnedReadHalf>,
         out: &DelayedSender,
+        refusal: Option<Error>,
     ) -> std::io::Result<()> {
         let mut streams = InboundStreams::default();
         loop {
             let (id, req): (u64, Request) = read_frame(&mut r).await?;
+            if let Some(e) = &refusal {
+                let reply: Reply = Err(e.clone());
+                out.send(encode(&(id, reply)));
+                continue;
+            }
             let req = match req {
                 Request::StreamAppend { stream, req } => {
                     streams.push(&self.inner.raft, out, stream, id, req);

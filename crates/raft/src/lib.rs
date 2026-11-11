@@ -42,7 +42,27 @@ openraft::declare_raft_types!(
     pub TypeConfig:
         D = Proposals,
         R = Vec<Outcome>,
+        Node = Member,
 );
+
+/// A member of the cluster, as the membership in the log records it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Member {
+    /// Where the node listens.
+    pub addr: String,
+    /// The incarnation of the node's directory when the node was made a
+    /// member: a random number written there when the directory was created.
+    /// Other nodes send it with every connection, and a node whose directory
+    /// has another incarnation refuses the connection, because it lost what
+    /// it had stored as this member. 0 is not checked.
+    pub incarnation: u64,
+}
+
+impl std::fmt::Display for Member {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (incarnation {})", self.addr, self.incarnation)
+    }
+}
 
 /// The application data of one log entry: the proposals it orders, opaque
 /// to this crate. A newtype because openraft 0.10 needs `Display` on it.

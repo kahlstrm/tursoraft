@@ -239,7 +239,9 @@ fn new_voters_killed_in_the_middle_of_the_move() {
 /// voter loses its disk: Tokyo is killed and falls behind while Singapore
 /// and Hong Kong acknowledge quorum transfers; then both are killed, Hong
 /// Kong restarts with an empty directory and votes for Tokyo, which leads
-/// with a log that lacks those transfers. The checker must report them as
+/// with a log that lacks those transfers. Hong Kong keeps the incarnation
+/// file of its Raft directory: without it, the other nodes would refuse Hong
+/// Kong as node 5, and the loss could not happen. The checker must report them as
 /// lost on Tokyo and Hong Kong. The test then writes 20 transfers through
 /// Tokyo, restarts Singapore, and prints what Singapore and Frankfurt do with
 /// the new leader's log, which conflicts with entries they know are
@@ -263,7 +265,11 @@ fn a_voter_that_forgets_its_log_loses_acknowledged_writes_and_the_checker_sees_i
             .filter(|a| a.result.is_ok() && a.started > behind)
             .count();
         assert!(acked_while_6_down > 0);
+        let incarnation = c.dir.path().join("node-5/raft/incarnation");
+        let kept = std::fs::read(&incarnation).unwrap();
         c.wipe(5);
+        std::fs::create_dir_all(incarnation.parent().unwrap()).unwrap();
+        std::fs::write(&incarnation, kept).unwrap();
         c.start(5);
         c.start(6);
         let leader = c.wait_leader(&[5, 6]).await;

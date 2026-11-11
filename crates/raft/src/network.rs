@@ -1,7 +1,8 @@
 //! TCP transport between nodes and from clients.
 //!
 //! Every frame is `[u32 length][bincode]`. A connection starts with a
-//! [`Hello`] naming the sending node (or none, for a client). After that the
+//! [`Hello`] naming the sending node (or none, for a client) and the
+//! incarnation it expects the receiving node to have. After that the
 //! connecting side sends `(request id, Request)` frames and the other side
 //! answers with `(request id, Result<Response, Error>)` frames, in any order,
 //! so a connection carries any number of requests at once.
@@ -35,7 +36,7 @@ use openraft::raft::{
     AppendEntriesRequest, AppendResult, SnapshotResponse, StreamAppendResult,
     TransferLeaderRequest, TransferLeaderResponse, VoteRequest, VoteResponse,
 };
-use openraft::{BasicNode, OptionalSend};
+use openraft::OptionalSend;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufWriter};
@@ -44,7 +45,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
-use crate::{DelayTable, Error, NodeId, PeerStats, Proposed, Status, TypeConfig, Vote};
+use crate::{DelayTable, Error, Member, NodeId, PeerStats, Proposed, Status, TypeConfig, Vote};
 
 const MAX_FRAME: usize = 1 << 30;
 const TIMER_LATENESS: Duration = Duration::from_millis(1);
@@ -52,6 +53,10 @@ const TIMER_LATENESS: Duration = Duration::from_millis(1);
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Hello {
     pub from: Option<NodeId>,
+    /// The incarnation the sender's membership records for the receiving
+    /// node, 0 if none. The receiver refuses the connection if its own
+    /// incarnation is another.
+    pub to_incarnation: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,6 +85,8 @@ pub(crate) enum Request {
     /// Run on the leader; the receiving node forwards it if needed.
     Client(LeaderOp),
     Initialize(BTreeMap<NodeId, String>),
+    /// Asks the node for its id and the incarnation of its directory.
+    Identify,
     Status,
     WaitApplied {
         index: u64,
@@ -122,6 +129,10 @@ pub(crate) enum Response {
         micros: u64,
     },
     App(Vec<u8>),
+    Identity {
+        id: NodeId,
+        incarnation: u64,
+    },
     Done,
 }
 
@@ -239,17 +250,20 @@ impl Network {
         }
     }
 
-    pub fn peer(&self, target: NodeId, addr: &str) -> Arc<Peer> {
+    /// The connection to `target`, which the membership records as
+    /// `member`.
+    pub fn peer(&self, target: NodeId, member: &Member) -> Arc<Peer> {
         let mut peers = self.peers.lock().unwrap();
         if let Some(p) = peers.get(&target) {
-            if p.addr == addr {
+            if p.addr == member.addr && p.incarnation == member.incarnation {
                 return p.clone();
             }
         }
         let p = Arc::new(Peer::new(
-            addr.to_string(),
+            member.addr.clone(),
             Some(self.id),
             self.delays.one_way(self.id, target),
+            member.incarnation,
         ));
         p.stats.lock().unwrap().stats.target = target;
         peers.insert(target, p.clone());
@@ -273,6 +287,8 @@ pub(crate) struct Peer {
     addr: String,
     from: Option<NodeId>,
     delay: Duration,
+    /// The incarnation the target must have, 0 for any.
+    incarnation: u64,
     conn: tokio::sync::Mutex<Option<Arc<Conn>>>,
     stats: Mutex<AppendStats>,
 }
@@ -306,11 +322,12 @@ impl Conn {
 }
 
 impl Peer {
-    pub fn new(addr: String, from: Option<NodeId>, delay: Duration) -> Self {
+    pub fn new(addr: String, from: Option<NodeId>, delay: Duration, incarnation: u64) -> Self {
         Peer {
             addr,
             from,
             delay,
+            incarnation,
             conn: tokio::sync::Mutex::new(None),
             stats: Mutex::new(AppendStats::default()),
         }
@@ -364,7 +381,10 @@ impl Peer {
         let (r, w) = stream.into_split();
         let closed = Arc::new(AtomicBool::new(false));
         let out = spawn_writer(w, self.delay, closed.clone());
-        out.send(encode(&Hello { from: self.from }));
+        out.send(encode(&Hello {
+            from: self.from,
+            to_incarnation: self.incarnation,
+        }));
         let conn = Arc::new(Conn {
             out,
             pending: Mutex::new(HashMap::new()),
@@ -429,10 +449,10 @@ pub(crate) struct NetworkFactory(pub Arc<Network>);
 impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
     type Network = PeerClient;
 
-    async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> PeerClient {
+    async fn new_client(&mut self, target: NodeId, node: &Member) -> PeerClient {
         let net = &self.0;
         PeerClient {
-            peer: net.peer(target, &node.addr),
+            peer: net.peer(target, node),
             append_timeout: net.heartbeat + 2 * net.delays.rtt(net.id, target),
         }
     }

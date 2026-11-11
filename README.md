@@ -18,6 +18,9 @@ dependencies. This workspace is not a member of Turso's workspace. It uses
 resolver 3, so the lockfile only picks dependency versions that support Rust
 1.88.
 
+Why it is built this way: the decisions and the alternatives they rejected
+are in [`docs/adr/`](docs/adr/README.md).
+
 ## Build
 
 ```bash

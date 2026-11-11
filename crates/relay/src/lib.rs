@@ -39,8 +39,9 @@ use tursoraft_node::{ChangeKind, Changes, Event, Node, RowChange, Subscription, 
 
 use protocol::{CopyRow, FollowerMessage, Kind, RelayMessage, Row, Values};
 
-/// Where and how a relay sends.
-#[derive(Debug, Clone)]
+/// Where and how a relay sends. Its `Debug` leaves the secret out, so that
+/// logging a config does not reveal it.
+#[derive(Clone)]
 pub struct Config {
     /// The Worker's relay endpoint, such as
     /// `wss://edge.example.workers.dev/relay?follower=weur`.
@@ -61,8 +62,10 @@ pub struct Config {
     /// How long an unacknowledged message may wait before the connection is
     /// given up.
     pub ack_timeout: Duration,
-    /// The wait before connecting again after a failure.
+    /// The wait before connecting again after a failure. It doubles with
+    /// each failure in a row, up to `max_retry`.
     pub retry: Duration,
+    pub max_retry: Duration,
 }
 
 impl Config {
@@ -76,7 +79,24 @@ impl Config {
             tick: Duration::from_millis(200),
             ack_timeout: Duration::from_secs(30),
             retry: Duration::from_millis(500),
+            max_retry: Duration::from_secs(30),
         }
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("url", &self.url)
+            .field("secret", &"<hidden>")
+            .field("window", &self.window)
+            .field("max_events", &self.max_events)
+            .field("max_bytes", &self.max_bytes)
+            .field("tick", &self.tick)
+            .field("ack_timeout", &self.ack_timeout)
+            .field("retry", &self.retry)
+            .field("max_retry", &self.max_retry)
+            .finish()
     }
 }
 
@@ -172,16 +192,23 @@ enum Restart {
 }
 
 async fn run(node: Node, config: Config, shared: Arc<Shared>) {
+    let mut wait = config.retry;
     loop {
+        let copies = shared.stats.lock().unwrap().copies;
         match session(&node, &config, &shared).await {
             Stop::NodeGone => {
                 tracing::info!("relay: node {} shut down; stopping", node.id());
                 return;
             }
             Stop::Failed(e) => {
-                tracing::warn!("relay: {e}; connecting again in {:?}", config.retry);
+                // A session that got as far as a copy was not a failure in a row.
+                if shared.stats.lock().unwrap().copies > copies {
+                    wait = config.retry;
+                }
+                tracing::warn!("relay: {e}; connecting again in {wait:?}");
                 shared.stats.lock().unwrap().failures += 1;
-                tokio::time::sleep(config.retry).await;
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(config.max_retry.max(config.retry));
             }
         }
     }
@@ -585,5 +612,18 @@ impl Conn {
             )),
             _ => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn a_config_does_not_show_its_secret() {
+        let config = Config::new("wss://edge.example/relay", "s3cret-value");
+        let shown = format!("{config:?} {config:#?}");
+        assert!(!shown.contains("s3cret-value"), "{shown}");
+        assert!(shown.contains("wss://edge.example/relay"), "{shown}");
     }
 }

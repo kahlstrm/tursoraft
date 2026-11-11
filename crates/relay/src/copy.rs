@@ -80,7 +80,9 @@ pub(crate) async fn read(node: &Node) -> Result<Copy, String> {
             continue;
         }
         return Ok(Copy {
-            index: index.ok_or("the node has no applied index")?,
+            // A node that has applied nothing yet has no row there, and an
+            // empty database: a copy at index 0.
+            index: index.unwrap_or(0),
             schema,
             tables,
             rows,

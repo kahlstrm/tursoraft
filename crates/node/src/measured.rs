@@ -1,4 +1,5 @@
-//! Counters of one node, and the state machine wrapper that times applying.
+//! Counters of one node, and the state machine wrapper that times applying
+//! and sends what it applied to subscribers.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
@@ -7,6 +8,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tursoraft_changeset::TursoStateMachine;
 use tursoraft_statemachine::{Applied, Entry, Outcome, Snapshot, StateMachine};
+
+use crate::subscribe::Feed;
 
 /// What one node has done since it started.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +60,8 @@ pub struct Stats {
     /// Async writes acknowledged and then rejected or lost.
     pub async_acked_then_failed: u64,
     /// State machine: entries applied (blank and membership entries
-    /// included), change sets in them, and the time spent applying.
+    /// included), change sets in them, and the time spent applying, sending
+    /// to subscribers included.
     pub applied_entries: u64,
     pub applied_change_sets: u64,
     pub apply_micros: u64,
@@ -128,15 +132,20 @@ impl Counters {
     }
 }
 
-/// [`TursoStateMachine`] with counters.
+/// [`TursoStateMachine`] with counters and subscribers.
 pub(crate) struct MeasuredStateMachine {
     inner: TursoStateMachine,
     counters: Arc<Counters>,
+    feed: Arc<Feed>,
 }
 
 impl MeasuredStateMachine {
-    pub(crate) fn new(inner: TursoStateMachine, counters: Arc<Counters>) -> Self {
-        MeasuredStateMachine { inner, counters }
+    pub(crate) fn new(inner: TursoStateMachine, counters: Arc<Counters>, feed: Arc<Feed>) -> Self {
+        MeasuredStateMachine {
+            inner,
+            counters,
+            feed,
+        }
     }
 }
 
@@ -150,6 +159,7 @@ impl StateMachine for MeasuredStateMachine {
     fn apply(&mut self, entry: &Entry) -> Result<Vec<Outcome>, Self::Error> {
         let started = Instant::now();
         let outcomes = self.inner.apply(entry)?;
+        self.feed.applied(entry, &outcomes);
         let c = &self.counters;
         c.apply_micros
             .fetch_add(started.elapsed().as_micros() as u64, Relaxed);
@@ -167,6 +177,7 @@ impl StateMachine for MeasuredStateMachine {
 
     fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), Self::Error> {
         self.inner.install_snapshot(snapshot)?;
+        self.feed.reset(snapshot.applied.index);
         self.counters.snapshots_installed.fetch_add(1, Relaxed);
         Ok(())
     }

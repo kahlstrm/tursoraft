@@ -22,12 +22,17 @@
 //! Reads ([`Node::query`]) run one `SELECT` on this node's file, at the
 //! [`ReadLevel`] the caller asks for.
 //!
+//! Change subscriptions ([`Node::subscribe`]) give an application in the
+//! same process the row changes of every change set this node applies, in
+//! log order; see [`Subscription`].
+//!
 //! [`Client`] reaches a node process over TCP, for tests and tools.
 
 mod client;
 mod leader;
 mod measured;
 mod reads;
+mod subscribe;
 mod transaction;
 
 use std::path::Path;
@@ -43,6 +48,7 @@ use tursoraft_raft::NodeConfig;
 
 pub use client::Client;
 pub use measured::Stats;
+pub use subscribe::{ChangeKind, Changes, Event, RowChange, Subscription};
 pub use transaction::{ClientTransaction, Transaction};
 
 /// One node. Cloning gives another handle to the same node.
@@ -63,6 +69,7 @@ struct Inner {
     options: Options,
     /// Interactive transactions that [`Client`]s opened on this node.
     open: transaction::Open,
+    feed: Arc<subscribe::Feed>,
 }
 
 /// Settings of one node that the cluster configuration does not hold.
@@ -78,6 +85,15 @@ pub struct Options {
     /// lock of its file while an apply, or another interactive transaction,
     /// waits for it, in milliseconds. It then ends with [`Error::Aborted`].
     pub local_hold_ms: u64,
+    /// Most events a subscriber may fall behind before it loses the oldest
+    /// ones and receives [`Event::Lagged`]; see [`Node::subscribe`]. Rounded
+    /// up to a power of two.
+    #[serde(default = "default_subscriber_queue")]
+    pub subscriber_queue: usize,
+}
+
+fn default_subscriber_queue() -> usize {
+    1024
 }
 
 impl Default for Options {
@@ -85,6 +101,7 @@ impl Default for Options {
         Options {
             max_pending_groups: 256,
             local_hold_ms: 1000,
+            subscriber_queue: default_subscriber_queue(),
         }
     }
 }
@@ -225,6 +242,10 @@ impl Node {
             options.max_pending_groups >= 1,
             "max_pending_groups is at least 1"
         );
+        assert!(
+            options.subscriber_queue >= 1,
+            "subscriber_queue is at least 1"
+        );
         let db_path = db_path.as_ref();
         let db = NodeDb::open(db_path).map_err(|e| Error::Internal(e.to_string()))?;
         db.set_local_hold_limit(Duration::from_millis(options.local_hold_ms));
@@ -235,8 +256,12 @@ impl Node {
             None
         };
         let counters = Arc::new(measured::Counters::default());
+        let feed = Arc::new(subscribe::Feed::new(
+            db.applied_index(),
+            options.subscriber_queue,
+        ));
         let state_machine =
-            measured::MeasuredStateMachine::new(db.state_machine(), counters.clone());
+            measured::MeasuredStateMachine::new(db.state_machine(), counters.clone(), feed.clone());
         let timeout = Duration::from_millis(config.propose_timeout_ms);
         let raft = tursoraft_raft::Node::start(config, state_machine)
             .await
@@ -252,6 +277,7 @@ impl Node {
                 timeout,
                 options: options.clone(),
                 open: Default::default(),
+                feed,
             }),
         };
         tokio::spawn(leader::run(
@@ -359,6 +385,47 @@ impl Node {
             .map_err(|e| Error::Internal(e.to_string()))?
     }
 
+    /// Subscribes to the changes this node applies from now on. Returns the
+    /// applied index the subscription starts after: its first
+    /// [`Event::Changes`] is the first change set applied after that index.
+    ///
+    /// Each applied change set sends one [`Event::Changes`], in log order,
+    /// after the entry's database transaction has committed, so a read on
+    /// this node started after the event sees it. A rejected change set
+    /// sends nothing, and an event always holds a whole transaction.
+    ///
+    /// To keep something derived from the database, such as a copy of a
+    /// table, subscribe first, then read the database, then apply the events
+    /// whose index is above the one the read saw. One `SELECT` can return
+    /// that index with the rows, for example
+    /// `SELECT a.log_index, t.* FROM tursoraft_applied a LEFT JOIN t`.
+    /// Read again after [`Event::Reset`] and [`Event::Lagged`].
+    ///
+    /// Applying never waits for a subscriber: one that falls
+    /// [`Options::subscriber_queue`] events behind loses the oldest. Events
+    /// are not stored; after a restart, subscribe and read again.
+    ///
+    /// ```no_run
+    /// # async fn follow(node: tursoraft_node::Node) {
+    /// use tursoraft_node::Event;
+    /// let (after, mut events) = node.subscribe();
+    /// // ... read the database here, at an index of at least `after` ...
+    /// while let Some(event) = events.recv().await {
+    ///     match event {
+    ///         Event::Changes(c) => {
+    ///             for row in c.rows.iter() {
+    ///                 println!("{} {:?} {} {:?}", row.table, row.kind, row.rowid, row.after);
+    ///             }
+    ///         }
+    ///         Event::Reset { .. } | Event::Lagged { .. } => { /* read again */ }
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    pub fn subscribe(&self) -> (u64, Subscription) {
+        self.inner.feed.subscribe()
+    }
+
     /// Counters of this node, for tests and benchmarks.
     pub fn stats(&self) -> Stats {
         self.inner.counters.stats(
@@ -368,8 +435,11 @@ impl Node {
         )
     }
 
+    /// Stops the node. Subscriptions end once they have received the events
+    /// sent before.
     pub async fn shutdown(&self) {
         self.inner.raft.shutdown().await;
+        self.inner.feed.close();
     }
 
     /// Hands the transaction to this node's leader loop.

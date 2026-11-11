@@ -559,8 +559,32 @@ async fn leader_killed_while_clients_write_loses_no_quorum_write() {
             }));
         }
     }
+    // Async writers at the leader keep many groups pending behind the
+    // quorum writes. Their writes may be lost; they are not checked.
+    for w in 0..2 {
+        let client = c.client(old_leader).with_timeout(Duration::from_secs(15));
+        let stop = stop.clone();
+        writers.push(tokio::spawn(async move {
+            let mut seq = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let key = format!("async-w{w}-{seq}");
+                seq += 1;
+                let stmt = Statement::new("INSERT INTO w VALUES (?)", vec![Value::Text(key)]);
+                if client.execute(vec![stmt], CommitMode::Async).await.is_err() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }));
+    }
     tokio::time::sleep(Duration::from_secs(1)).await;
     let before_kill = acked.lock().unwrap().len();
+    let leader_stats = c.client(old_leader).stats().await.unwrap();
+    let status = c.status(old_leader).await;
+    println!(
+        "old leader before the kill: {} groups proposed, up to {} pending at once; log ends at {:?}, applied {:?}",
+        leader_stats.groups, leader_stats.max_groups_pending, status.last_log_index, status.applied
+    );
+    assert!(leader_stats.max_groups_pending > 1, "{leader_stats:?}");
     c.kill(old_leader);
     killed.store(true, Ordering::Relaxed);
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -600,4 +624,270 @@ async fn leader_killed_while_clients_write_loses_no_quorum_write() {
         );
     }
     assert_eq!(c.dump(survivors[0]).await, c.dump(survivors[1]).await);
+}
+
+/// Async writers at the leader, each transaction reading the ones before
+/// it: with pipelining, many groups are pending at once, every read sees
+/// every earlier write, and every acknowledged write is applied, at the index
+/// it was acknowledged with. Without pipelining the same holds, one group at
+/// a time.
+#[tokio::test(flavor = "multi_thread")]
+async fn pipelined_writes_that_read_each_other_apply_in_capture_order() {
+    const WRITERS: i64 = 4;
+    const EACH: i64 = 30;
+    for max_pending in ["256", "1"] {
+        let mut c = Cluster::new(&[1, 2, 3], |cfg| cfg.delays = DelayTable::uniform(30.0));
+        c.node_args = vec!["--max-pending-groups".into(), max_pending.into()];
+        c.start_all();
+        let leader = c.initialize(&[1, 2, 3]).await;
+        c.client(leader)
+            .execute(
+                statements(&[
+                    "CREATE TABLE c(id INTEGER PRIMARY KEY, n INTEGER)",
+                    "CREATE TABLE log(n INTEGER, seen INTEGER)",
+                    "INSERT INTO c VALUES (1, 0)",
+                ]),
+                QUORUM,
+            )
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let tasks: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let client = c.client(leader);
+                tokio::spawn(async move {
+                    let mut seen = Vec::new();
+                    let mut last_index = 0;
+                    for _ in 0..EACH {
+                        let w = client
+                            .execute(
+                                statements(&[
+                                    "UPDATE c SET n = n + 1",
+                                    "INSERT INTO log SELECT n, (SELECT count(*) FROM log) FROM c",
+                                    "SELECT n FROM c",
+                                ]),
+                                CommitMode::Async,
+                            )
+                            .await
+                            .unwrap();
+                        assert!(w.index > last_index, "{} after {last_index}", w.index);
+                        last_index = w.index;
+                        seen.push(w.results[2].rows[0][0].clone());
+                    }
+                    seen
+                })
+            })
+            .collect();
+        let mut seen = BTreeSet::new();
+        for t in tasks {
+            for v in t.await.unwrap() {
+                let Value::Integer(v) = v else {
+                    panic!("{v:?}")
+                };
+                assert!(seen.insert(v), "two transactions read the same count {v}");
+            }
+        }
+        let elapsed = started.elapsed();
+        let total = WRITERS * EACH;
+        assert_eq!(seen, (1..=total).collect());
+        let stats = c.client(leader).stats().await.unwrap();
+        c.converge(leader, &[1, 2, 3]).await;
+        let stats_after = c.client(leader).stats().await.unwrap();
+        println!(
+            "max_pending_groups {max_pending}: {total} async writes in {elapsed:?}; at the last ack: {stats:?}; after: {stats_after:?}"
+        );
+        assert_eq!(stats_after.rejected, 0);
+        assert_eq!(stats_after.async_acked_then_failed, 0);
+        assert_eq!(stats_after.async_index_mismatches, 0);
+        assert_eq!(stats_after.unknown_indexes, 0);
+        if max_pending == "1" {
+            assert_eq!(stats.max_groups_pending, 1);
+        } else {
+            assert!(stats.max_groups_pending > 1, "{stats:?}");
+            assert_eq!(stats_after.resets, 1);
+        }
+        for id in [1, 2, 3] {
+            let client = c.client(id);
+            assert_eq!(
+                count(&client, "SELECT n FROM c", ReadLevel::Local).await,
+                total
+            );
+            assert_eq!(
+                count(
+                    &client,
+                    "SELECT count(*) FROM log WHERE seen = n - 1",
+                    ReadLevel::Local
+                )
+                .await,
+                total
+            );
+        }
+        assert_eq!(c.dump(1).await, c.dump(2).await);
+        assert_eq!(c.dump(1).await, c.dump(3).await);
+    }
+}
+
+/// An async write at the leader is acknowledged once the leader has flushed
+/// its log, well before a majority stores it; the leader's own file gets it
+/// only when the entry is committed and applied, so a local read right after
+/// the acknowledgement does not see it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_async_write_is_acknowledged_before_any_file_has_it() {
+    let mut c = Cluster::new(&[1, 2, 3], |cfg| cfg.delays = DelayTable::uniform(200.0));
+    c.start_all();
+    let leader = c.initialize(&[1, 2, 3]).await;
+    let client = c.client(leader);
+    client
+        .execute(statements(&["CREATE TABLE t(v INTEGER)"]), QUORUM)
+        .await
+        .unwrap();
+    for i in 0..5 {
+        let started = std::time::Instant::now();
+        let w = client
+            .execute(
+                vec![Statement::new(
+                    "INSERT INTO t VALUES (?)",
+                    vec![Value::Integer(i)],
+                )],
+                CommitMode::Async,
+            )
+            .await
+            .unwrap();
+        let acked = started.elapsed();
+        let seen = count(
+            &client,
+            &format!("SELECT count(*) FROM t WHERE v = {i}"),
+            ReadLevel::Local,
+        )
+        .await;
+        println!(
+            "async write {i}: acknowledged in {acked:?} at index {}, visible locally: {seen}",
+            w.index
+        );
+        assert!(acked < Duration::from_millis(100), "{acked:?}");
+        assert_eq!(seen, 0, "the leader's file has a write no majority stored");
+        let at_index = count(
+            &client,
+            &format!("SELECT count(*) FROM t WHERE v = {i}"),
+            ReadLevel::AtIndex(w.index),
+        )
+        .await;
+        assert_eq!(at_index, 1);
+    }
+}
+
+/// A change set from elsewhere comes into the log between groups the
+/// leader captured ahead, so the first of those groups loses a write
+/// conflict. The groups and the read-only transaction captured on top of it
+/// read a state that never existed: the writes are rejected on every node,
+/// one that was down at the time included, and the read fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_group_rejects_the_pending_transactions_that_read_it() {
+    let mut c = Cluster::new(&[1, 2, 3], |cfg| cfg.delays = DelayTable::uniform(100.0));
+    c.start_all();
+    let leader = c.initialize(&[1, 2, 3]).await;
+    let down = [1, 2, 3].into_iter().rev().find(|n| *n != leader).unwrap();
+    let setup = [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)",
+        "CREATE TABLE seen(v TEXT)",
+        "INSERT INTO t VALUES (1, 'a')",
+    ];
+    let client = c.client(leader);
+    client.execute(statements(&setup), QUORUM).await.unwrap();
+
+    // The same rows in a local file give a change set with the cluster's
+    // before-image of row 1, as a former leader could have captured it.
+    let dir = tempfile::TempDir::new().unwrap();
+    let local = tursoraft_changeset::NodeDb::open(dir.path().join("local.db")).unwrap();
+    let capture = |sqls: &[&str]| {
+        let s: Vec<_> = sqls.iter().map(|s| (*s).into()).collect();
+        local.capture(&s).unwrap().change_set
+    };
+    let setup_set = capture(&setup);
+    use tursoraft_statemachine::StateMachine;
+    local
+        .state_machine()
+        .apply(&tursoraft_statemachine::Entry {
+            index: 1,
+            raft_meta: Vec::new(),
+            proposals: vec![setup_set],
+        })
+        .unwrap();
+    let foreign = capture(&["UPDATE t SET v = 'foreign' WHERE id = 1"]);
+
+    c.kill(down);
+    let proposed = client.raft().propose(foreign).await.unwrap();
+    assert_eq!(proposed.outcome, tursoraft_raft::Outcome::Applied);
+
+    // Captured on the leader's ahead file, which lacks the foreign write.
+    let first = client
+        .execute(
+            statements(&["UPDATE t SET v = v || '+n' WHERE id = 1"]),
+            CommitMode::Async,
+        )
+        .await
+        .unwrap();
+    let read_async = client
+        .execute(
+            statements(&["SELECT v FROM t WHERE id = 1"]),
+            CommitMode::Async,
+        )
+        .await
+        .unwrap();
+    let (second, read_quorum, third) = tokio::join!(
+        client.execute(
+            statements(&["INSERT INTO seen SELECT v FROM t WHERE id = 1"]),
+            QUORUM
+        ),
+        client.execute(statements(&["SELECT v FROM t WHERE id = 1"]), QUORUM),
+        client.execute(statements(&["INSERT INTO seen VALUES ('other')"]), QUORUM),
+    );
+    println!(
+        "first (async) {first:?}\nasync read {read_async:?}\nsecond {second:?}\nquorum read {read_quorum:?}\nthird {third:?}"
+    );
+    // Documented: an async read-only transaction is answered from the
+    // pending state at once.
+    assert_eq!(
+        read_async.results[0].rows,
+        vec![vec![Value::Text("a+n".into())]]
+    );
+    for result in [&second, &read_quorum, &third] {
+        assert!(
+            matches!(result, Err(Error::Rejected(_))),
+            "expected a rejection: {result:?}"
+        );
+    }
+    let stats = client.stats().await.unwrap();
+    println!("leader: {stats:?}");
+    assert_eq!(stats.async_acked_then_failed, 1);
+
+    // The next group is captured after a reset and sees the foreign write.
+    let after = client
+        .execute(
+            statements(&["INSERT INTO seen SELECT v FROM t WHERE id = 1"]),
+            QUORUM,
+        )
+        .await
+        .unwrap();
+    println!("after the reset: {after:?}");
+
+    c.start(down);
+    c.converge(leader, &[1, 2, 3]).await;
+    for id in [1, 2, 3] {
+        let client = c.client(id);
+        assert_eq!(
+            rows(&client, "SELECT v FROM t", ReadLevel::Local).await,
+            vec![vec![Value::Text("foreign".into())]],
+            "node {id}"
+        );
+        assert_eq!(
+            rows(&client, "SELECT v FROM seen", ReadLevel::Local).await,
+            vec![vec![Value::Text("foreign".into())]],
+            "node {id}"
+        );
+        let s = client.stats().await.unwrap();
+        println!("node {id}: {s:?}");
+    }
+    assert_eq!(c.dump(1).await, c.dump(2).await);
+    assert_eq!(c.dump(1).await, c.dump(3).await);
 }

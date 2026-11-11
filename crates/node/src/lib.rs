@@ -5,12 +5,14 @@
 //! Writes. A write transaction is a list of statements sent in one call
 //! ([`Node::execute`]). Any node accepts it; a follower sends it to the leader
 //! with [`tursoraft_raft::Node::app_request`]. The leader runs the
-//! transactions that are waiting as one group with
-//! [`NodeDb::capture_batch`] and proposes their change sets as one log entry
-//! with [`tursoraft_raft::Node::propose_many`]. It captures the next group
-//! only after it has applied everything in its log, so every capture sees
-//! every earlier change set. No node writes its file except by applying a
-//! committed entry.
+//! transactions that are waiting as one group and proposes their change sets
+//! as one log entry. Without pipelining it captures a group on its own file
+//! with [`NodeDb::capture_batch`], after it has applied everything in its log.
+//! With pipelining ([`Options::max_pending_groups`]) it captures the next
+//! group while earlier ones are still on their way through Raft, on a second
+//! file that runs ahead ([`tursoraft_changeset::AheadDb`]); see the `leader`
+//! module. Either way, every capture sees every earlier change set, and no
+//! node writes its database file except by applying a committed entry.
 //!
 //! Reads ([`Node::query`]) run one `SELECT` on this node's file, at the
 //! [`ReadLevel`] the caller asks for.
@@ -30,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tursoraft_changeset::turso_core::{self, Numeric};
-use tursoraft_changeset::NodeDb;
+use tursoraft_changeset::{AheadDb, NodeDb};
 use tursoraft_raft::NodeConfig;
 
 pub use client::Client;
@@ -51,6 +53,26 @@ struct Inner {
     counters: Arc<measured::Counters>,
     /// How long a write waits for a leader, and a read for a log position.
     timeout: Duration,
+    options: Options,
+}
+
+/// Settings of one node that the cluster configuration does not hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Options {
+    /// Most groups of transactions the leader has proposed and not yet
+    /// applied. 1 turns pipelining off: the leader captures a group only
+    /// after it has applied the one before. Above 1, the leader keeps a
+    /// second database file next to the node's own (`<name>.ahead.db` for
+    /// `<name>.db`) to capture on.
+    pub max_pending_groups: usize,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options {
+            max_pending_groups: 256,
+        }
+    }
 }
 
 /// When a write is acknowledged. Chosen per transaction.
@@ -170,7 +192,27 @@ impl Node {
     /// [`tursoraft_raft::Node::add_follower`]; it then gets the database as a
     /// snapshot or as log entries.
     pub async fn start(config: NodeConfig, db_path: impl AsRef<Path>) -> Result<Node, Error> {
+        Node::start_with(config, db_path, Options::default()).await
+    }
+
+    /// [`Node::start`] with `options`.
+    pub async fn start_with(
+        config: NodeConfig,
+        db_path: impl AsRef<Path>,
+        options: Options,
+    ) -> Result<Node, Error> {
+        assert!(
+            options.max_pending_groups >= 1,
+            "max_pending_groups is at least 1"
+        );
+        let db_path = db_path.as_ref();
         let db = NodeDb::open(db_path).map_err(|e| Error::Internal(e.to_string()))?;
+        let ahead = if options.max_pending_groups > 1 {
+            let path = db_path.with_extension("ahead.db");
+            Some(AheadDb::open(path).map_err(|e| Error::Internal(e.to_string()))?)
+        } else {
+            None
+        };
         let counters = Arc::new(measured::Counters::default());
         let state_machine =
             measured::MeasuredStateMachine::new(db.state_machine(), counters.clone());
@@ -187,9 +229,15 @@ impl Node {
                 queue,
                 counters,
                 timeout,
+                options: options.clone(),
             }),
         };
-        tokio::spawn(leader::run(Arc::downgrade(&node.inner), rx));
+        tokio::spawn(leader::run(
+            Arc::downgrade(&node.inner),
+            rx,
+            ahead,
+            options.max_pending_groups,
+        ));
         let weak: Weak<Inner> = Arc::downgrade(&node.inner);
         raft.set_app_handler(Arc::new(move |_, request| {
             let weak = weak.clone();
@@ -223,7 +271,19 @@ impl Node {
     /// leader stops being leader before a majority has stored the entry: it
     /// crashes, or it is cut off, and the new leader's log lacks the entry. A
     /// crash of the leader alone does not lose it if the leader restarts and
-    /// wins the next election, since the entry is in its flushed log.
+    /// wins the next election, since the entry is in its flushed log. An async
+    /// write acknowledged and later rejected, because it read a pending write
+    /// that was rejected, also has no effect; [`Stats::async_acked_then_failed`]
+    /// counts both cases.
+    ///
+    /// A transaction that changes no rows gets no log entry. In
+    /// [`CommitMode::Quorum`] it is answered once a majority has confirmed
+    /// that the leader still leads, as for [`ReadLevel::Linearizable`], and
+    /// once the pending writes it read are applied; if one of those was
+    /// rejected or lost, it fails with [`Error::Rejected`]. In
+    /// [`CommitMode::Async`] it is answered at once from the leader's state,
+    /// which may include writes that no majority has stored yet; a leader that
+    /// was replaced without knowing it may answer from a stale state.
     ///
     /// See [`Error`] for which failures had an effect.
     pub async fn execute(
@@ -272,9 +332,11 @@ impl Node {
 
     /// Counters of this node, for tests and benchmarks.
     pub fn stats(&self) -> Stats {
-        self.inner
-            .counters
-            .stats(self.id(), self.inner.db.applied_index())
+        self.inner.counters.stats(
+            self.id(),
+            self.inner.db.applied_index(),
+            self.inner.options.max_pending_groups,
+        )
     }
 
     pub async fn shutdown(&self) {

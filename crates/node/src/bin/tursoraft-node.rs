@@ -1,8 +1,11 @@
 //! One tursoraft node in its own process.
 //!
 //! ```text
-//! tursoraft-node --config cluster.json --id 1 --dir /tmp/n1
+//! tursoraft-node --config cluster.json --id 1 --dir /tmp/n1 [--max-pending-groups N]
 //! ```
+//!
+//! `--max-pending-groups` sets [`tursoraft_node::Options::max_pending_groups`]
+//! (default 256); 1 turns pipelining off.
 //!
 //! `cluster.json` is a [`tursoraft_raft::ClusterConfig`]. The node keeps its
 //! Raft log in `DIR/raft` and its database in `DIR/data.db`, and prints
@@ -24,6 +27,7 @@ async fn main() {
     let mut config_path = None;
     let mut id = None;
     let mut dir = None;
+    let mut options = tursoraft_node::Options::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || {
@@ -40,6 +44,12 @@ async fn main() {
                 )
             }
             "--dir" => dir = Some(PathBuf::from(value())),
+            "--max-pending-groups" => {
+                options.max_pending_groups =
+                    value().parse().ok().filter(|n| *n >= 1).unwrap_or_else(|| {
+                        usage("--max-pending-groups must be a number of at least 1")
+                    })
+            }
             other => usage(&format!("unknown argument {other}")),
         }
     }
@@ -53,7 +63,7 @@ async fn main() {
         .node_config(id, dir.join("raft"))
         .unwrap_or_else(|| usage(&format!("node {id} is not in the cluster config")));
     std::fs::create_dir_all(&dir).expect("create the node directory");
-    let node = tursoraft_node::Node::start(config, dir.join("data.db"))
+    let node = tursoraft_node::Node::start_with(config, dir.join("data.db"), options)
         .await
         .expect("start the node");
 
@@ -64,6 +74,6 @@ async fn main() {
 
 fn usage(msg: &str) -> ! {
     eprintln!("{msg}");
-    eprintln!("usage: tursoraft-node --config FILE --id N --dir DIR");
+    eprintln!("usage: tursoraft-node --config FILE --id N --dir DIR [--max-pending-groups N]");
     std::process::exit(2);
 }

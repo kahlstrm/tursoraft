@@ -18,6 +18,9 @@ pub struct Cluster {
     pub config: ClusterConfig,
     config_path: PathBuf,
     procs: BTreeMap<NodeId, Child>,
+    /// More arguments for every node process, such as
+    /// `--max-pending-groups 1`.
+    pub node_args: Vec<String>,
 }
 
 impl Cluster {
@@ -45,6 +48,7 @@ impl Cluster {
             config,
             config_path,
             procs: BTreeMap::new(),
+            node_args: Vec::new(),
         }
     }
 
@@ -67,6 +71,7 @@ impl Cluster {
             .arg(id.to_string())
             .arg("--dir")
             .arg(self.dir.path().join(format!("node-{id}")))
+            .args(&self.node_args)
             .env(
                 "RUST_LOG",
                 std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()),

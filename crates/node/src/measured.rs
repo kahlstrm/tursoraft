@@ -14,6 +14,18 @@ pub struct Stats {
     pub id: u64,
     /// The last log index whose effect is in the database file.
     pub applied_index: u64,
+    /// The setting: most groups pending at once; 1 is no pipelining.
+    pub max_pending_groups: u64,
+    /// Leader loop: the most groups that were pending at once.
+    pub max_groups_pending: u64,
+    /// Leader loop: copies of the database file to the ahead file, and the
+    /// time they took.
+    pub resets: u64,
+    pub reset_micros: u64,
+    /// Leader loop: groups whose log index was not known when they were
+    /// handed to Raft, because another entry was appended at the same time.
+    /// Their async transactions are acknowledged when applied.
+    pub unknown_indexes: u64,
     /// Leader loop: log entries proposed, one per group.
     pub groups: u64,
     /// Leader loop: transactions proposed.
@@ -52,6 +64,10 @@ pub(crate) struct Counters {
     pub async_acked_early: AtomicU64,
     pub async_index_mismatches: AtomicU64,
     pub async_acked_then_failed: AtomicU64,
+    pub max_groups_pending: AtomicU64,
+    pub resets: AtomicU64,
+    pub reset_micros: AtomicU64,
+    pub unknown_indexes: AtomicU64,
     applied_entries: AtomicU64,
     applied_change_sets: AtomicU64,
     apply_micros: AtomicU64,
@@ -60,11 +76,16 @@ pub(crate) struct Counters {
 }
 
 impl Counters {
-    pub(crate) fn stats(&self, id: u64, applied_index: u64) -> Stats {
+    pub(crate) fn stats(&self, id: u64, applied_index: u64, max_pending_groups: usize) -> Stats {
         let get = |c: &AtomicU64| c.load(Relaxed);
         Stats {
             id,
             applied_index,
+            max_pending_groups: max_pending_groups as u64,
+            max_groups_pending: get(&self.max_groups_pending),
+            resets: get(&self.resets),
+            reset_micros: get(&self.reset_micros),
+            unknown_indexes: get(&self.unknown_indexes),
             groups: get(&self.groups),
             transactions: get(&self.transactions),
             failed: get(&self.failed),

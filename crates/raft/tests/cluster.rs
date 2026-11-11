@@ -275,8 +275,13 @@ async fn delay_table_sets_round_trip_and_acknowledgement_time() {
             );
             // Up to about 1 ms of real time on top of the table in a release
             // build run alone; more when debug builds of several clusters
-            // share the CPUs.
-            assert!(m >= rtt && m < rtt + Duration::from_millis(3), "{m:?}");
+            // share the CPUs. The delay writer sends 1 ms early to make up
+            // for tokio's timer firing late, so a measurement may land just
+            // under the table.
+            assert!(
+                m >= rtt - Duration::from_millis(1) && m < rtt + Duration::from_millis(3),
+                "{m:?}"
+            );
         }
 
         let sent_before = c.status(leader).await.sent;
@@ -315,10 +320,11 @@ async fn delay_table_sets_round_trip_and_acknowledgement_time() {
             summary(&back_to_back),
             per_write(&sent_between, &sent_after),
         );
+        let lower = rtt - Duration::from_millis(1);
         let m = median(&isolated);
-        assert!(m >= rtt && m < rtt + Duration::from_millis(8), "{m:?}");
+        assert!(m >= lower && m < rtt + Duration::from_millis(8), "{m:?}");
         let m = median(&back_to_back);
-        assert!(m >= rtt && m < rtt + Duration::from_millis(8), "{m:?}");
+        assert!(m >= lower && m < rtt + Duration::from_millis(8), "{m:?}");
     }
 }
 

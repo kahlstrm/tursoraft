@@ -206,8 +206,10 @@ async fn app_request_pays_the_round_trip_and_the_handler_can_propose() {
         let median = times[times.len() / 2];
         let rtt = Duration::from_secs_f64(rtt_ms / 1000.0);
         println!("app_request {from}->{to}, table {rtt_ms} ms: median {median:?}");
+        // The delay writer sends 1 ms early to make up for tokio's timer
+        // firing late, so a measurement may land just under the table.
         assert!(
-            median >= rtt && median < rtt + Duration::from_millis(3),
+            median >= rtt - Duration::from_millis(1) && median < rtt + Duration::from_millis(3),
             "{median:?}"
         );
     }

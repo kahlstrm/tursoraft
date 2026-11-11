@@ -1,0 +1,27 @@
+[package]
+name = "tursoraft-relay"
+description = "Sends the changes a tursoraft node applies to read-only follower Durable Objects"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+tursoraft-node = { path = "../node" }
+base64 = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# A deployed Worker is reached over wss://. Exactly one crypto provider, so
+# rustls picks it without being told.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde.workspace = true
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tursoraft-raft.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time"] }

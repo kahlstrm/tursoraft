@@ -52,6 +52,7 @@ def main(path):
         p("")
         cell_table(aws, fs, p, aws=True)
         p("")
+    group_commit_table(cells, p)
     learner_lag_table(cells, p)
     failover_table(rows, p)
     transfer_table(rows, p)
@@ -66,6 +67,8 @@ def main(path):
 def fsync_table(rows, p):
     fs = [r for r in rows.values() if r["kind"] == "fsync" and "result" in r]
     base = None
+    if not fs:
+        return 0.0
     p("### fdatasync of this orb (append a record, then fdatasync)")
     p("")
     p("| record | threads | samples | p50 ms | p99 ms |")
@@ -123,6 +126,33 @@ def cell_table(sel, fsync_ms, p, aws=False):
             f"| {x['writes_per_s']:.0f} | {x['entries_per_write']:.3f} "
             f"| {x['voter_append_requests_with_entries_per_write']:.3f} | {x['samples']} | {r['duration_s']:.0f}{flags} |"
         )
+
+
+def group_commit_table(cells, p):
+    sel = [r for r in cells if r["group"] == "log_group_commit"]
+    if not sel:
+        return
+    p("### Log writer: one fdatasync per append vs. group commit (3 voters, 200 B, batching off, at the leader)")
+    p("")
+    p("| RTT ms | writers | build | rep | p50 ms | p99 ms | max ms | writes/s | leader changed | samples | window s |")
+    p("|---|---|---|---|---|---|---|---|---|---|---|")
+
+    def key(r):
+        return (r["delays"]["default_rtt_ms"], r["writers"], r["variant"] != "per-append", r["name"])
+
+    for r in sorted(sel, key=key):
+        x = r["result"]
+        l = x["latency_ms"]
+        rep = r["name"].rsplit("rep=", 1)[-1]
+        flags = f" errors {x['errors']}" if x["errors"] else ""
+        if not x["all_nodes_applied_same_entries"]:
+            flags += " NODES DIFFER"
+        p(
+            f"| {r['delays']['default_rtt_ms']:g} | {r['writers']} | {r['variant']} | {rep} "
+            f"| {l['p50']:.2f} | {l['p99']:.2f} | {l['max']:.1f} | {x['writes_per_s']:.0f} "
+            f"| {'yes' if x['leader_changed'] else 'no'} | {x['samples']} | {r['duration_s']:.0f}{flags} |"
+        )
+    p("")
 
 
 def learner_lag_table(cells, p):

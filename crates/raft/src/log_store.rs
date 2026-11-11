@@ -5,10 +5,12 @@
 //! The vote and the last purged log id go into `meta`, replaced atomically
 //! (write `meta.tmp`, fsync, rename, fsync the directory).
 //!
-//! One writer thread owns the files and runs every write in order. An append
-//! calls `fdatasync` before it reports the entries flushed to openraft, a new
-//! or deleted segment file is followed by an fsync of the directory, and a vote
-//! is durable before `save_vote` returns. On startup a torn record at the end
+//! One writer thread owns the files and runs every write in order. It takes
+//! all appends waiting in its queue together, writes them, and calls
+//! `fdatasync` once for all of them (group commit) before it reports them
+//! flushed to openraft, in log order. A new or deleted segment file is
+//! followed by an fsync of the directory, and a vote is durable before
+//! `save_vote` returns. On startup a torn record at the end
 //! of the last segment (a crash during a write) is cut off; a bad record
 //! anywhere else is an error.
 //!
@@ -231,10 +233,49 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 }
 
 fn run_writer(dir: PathBuf, mut segments: Segments, rx: mpsc::Receiver<WriteCmd>) {
-    while let Ok(cmd) = rx.recv() {
+    let mut taken = None;
+    loop {
+        let cmd = match taken.take() {
+            Some(cmd) => cmd,
+            None => match rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => return,
+            },
+        };
         match cmd {
-            WriteCmd::Append { records, flushed } => {
-                flushed.io_completed(segments.append(&records))
+            WriteCmd::Append {
+                mut records,
+                flushed,
+            } => {
+                // One fdatasync for every waiting append keeps the queue
+                // short. Besides throughput this keeps the leader alive:
+                // openraft waits for a purge inside its main loop, and a
+                // purge waits for the appends queued before it, so a long
+                // queue stops the leader's heartbeats.
+                let mut waiting = vec![flushed];
+                while let Ok(cmd) = rx.try_recv() {
+                    match cmd {
+                        WriteCmd::Append {
+                            records: more,
+                            flushed,
+                        } => {
+                            records.extend(more);
+                            waiting.push(flushed);
+                        }
+                        other => {
+                            taken = Some(other);
+                            break;
+                        }
+                    }
+                }
+                let res = segments.append(&records);
+                for flushed in waiting {
+                    let res = match &res {
+                        Ok(()) => Ok(()),
+                        Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+                    };
+                    flushed.io_completed(res);
+                }
             }
             WriteCmd::SaveMeta { meta, done } => {
                 let _ = done.send(write_meta(&dir, &meta));

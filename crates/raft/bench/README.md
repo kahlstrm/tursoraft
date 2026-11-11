@@ -20,7 +20,9 @@ python3 -I crates/raft/bench/report.py crates/raft/bench-results/phase1c.jsonl
 ```
 
 `run` skips jobs whose name is already in the result file, so an
-interrupted run continues where it stopped. `--out FILE` writes elsewhere;
+interrupted run continues where it stopped. With `TURSORAFT_BENCH_KEEP=1`
+the cluster directories under `$TMPDIR/tursoraft-bench` (node logs, Raft
+logs) stay after each job; set `RUST_LOG` to choose what the nodes log. `--out FILE` writes elsewhere;
 `--jobs FILE` runs jobs from a file of JSON lines in the format `--list`
 prints. Each row holds the job as run, `started_unix`, `wall_s`, the git
 commit of the code (`code`), and the result or the error. `report.py`
@@ -117,4 +119,27 @@ moved to Frankfurt (node 1) before measuring.
   unbatched cells at 0 ms with 16 and 128 writers, rerun with a temporary
   change to the log writer that groups queued appends under one
   `fdatasync`. It shows how much of the unbatched ceiling is the per-append
-  flush.
+  flush. `phase1c.jsonl` was measured with one `fdatasync` per append.
+
+## Group commit in the log writer
+
+`group-commit.jsonl` (tables in `group-commit.md`) compares two builds in
+one run: `per-append`, the log writer of commit 5ee0229 with one
+`fdatasync` per append, and `group-commit`, the log writer that covers all
+appends waiting in its queue with one `fdatasync`. The cells are 3 voters,
+200 B, batching off, at the leader: 16 and 128 writers at 0, 10 and 100 ms,
+and one writer at 0 ms as a control. Each cell ran twice per build, the two
+builds alternating, in the second round in the other order. The jobs are in
+`bench/group-commit-jobs.jsonl`; each names its build in `variant`. To
+rerun, build both versions of `tursoraft-raft-node` and
+`tursoraft-raft-bench`, copy each pair into its own directory, and run
+each job with the pair its `variant` names:
+
+```sh
+while IFS= read -r job; do
+  v=$(printf '%s' "$job" | python3 -I -c 'import json,sys; print(json.loads(sys.stdin.read())["variant"])')
+  printf '%s\n' "$job" > /tmp/one-job.jsonl
+  "$DIR_OF/$v/tursoraft-raft-bench" run --jobs /tmp/one-job.jsonl --out crates/raft/bench-results/group-commit.jsonl
+done < crates/raft/bench/group-commit-jobs.jsonl
+python3 -I crates/raft/bench/report.py crates/raft/bench-results/group-commit.jsonl
+```

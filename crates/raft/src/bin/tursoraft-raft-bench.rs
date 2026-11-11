@@ -29,6 +29,10 @@
 //! `proxy` process in front of every node that holds each chunk of bytes for
 //! half the round trip in each direction while the delay table is zero.
 //!
+//! With `TURSORAFT_BENCH_KEEP` set, the cluster directories (node logs,
+//! Raft logs, cluster.json) under the temp directory's `tursoraft-bench`
+//! stay after each job.
+//!
 //! [`CountingStateMachine`]: tursoraft_raft::CountingStateMachine
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -57,7 +61,7 @@ const HIST_BASE: f64 = 1.02;
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Job {
     Fsync(FsyncSpec),
-    Cell(CellSpec),
+    Cell(Box<CellSpec>),
     Failover(FailoverSpec),
     Transfer(TransferSpec),
 }
@@ -110,6 +114,10 @@ struct CellSpec {
     /// [`Batching::max_entries_in_flight`]; `None` keeps the default.
     #[serde(default)]
     max_entries_in_flight: Option<usize>,
+    /// A label for the build that ran the cell, for comparing two builds of
+    /// the node in one result file. The benchmark does not use it.
+    #[serde(default)]
+    variant: Option<String>,
     warmup_s: f64,
     duration_s: f64,
 }
@@ -441,6 +449,7 @@ fn uniform(group: &str, voters: u64, learners: u64, rtt_ms: f64) -> CellSpec {
         writers: 1,
         batching: true,
         max_entries_in_flight: None,
+        variant: None,
         warmup_s: 0.0,
         duration_s: 0.0,
     }
@@ -510,6 +519,7 @@ fn aws(placement: char) -> CellSpec {
         writers: 1,
         batching: true,
         max_entries_in_flight: None,
+        variant: None,
         warmup_s: 0.0,
         duration_s: 0.0,
     }
@@ -558,7 +568,7 @@ impl CellSpec {
                 IssueAt::Farthest => "farthest",
             }
         );
-        Job::Cell(self)
+        Job::Cell(Box::new(self))
     }
 
     fn ids(&self) -> Vec<NodeId> {
@@ -820,7 +830,9 @@ impl Drop for Cluster {
             let _ = child.kill();
             let _ = child.wait();
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if std::env::var_os("TURSORAFT_BENCH_KEEP").is_none() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 

@@ -94,6 +94,10 @@ impl Node {
             max_payload_entries: config.log.max_payload_entries,
             snapshot_policy: SnapshotPolicy::LogsSinceLast(config.log.snapshot_every),
             max_in_snapshot_log_to_keep: config.log.keep_after_snapshot,
+            // A voter whose log is behind finds out in a pre-vote that it
+            // cannot win, before it raises its term and takes the votes of
+            // the others for that term.
+            enable_pre_vote: Some(true),
             ..Default::default()
         }
         .validate()

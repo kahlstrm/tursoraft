@@ -17,7 +17,7 @@ use tursoraft_proof::bank::{
 };
 use tursoraft_proof::cluster::{ms, Cluster};
 use tursoraft_proof::moves::{delays, move_voters, place, Seen, ALL, ASIA, EUROPE};
-use tursoraft_raft::NodeId;
+use tursoraft_raft::{NodeId, RaftTimeouts};
 
 const BIN: &str = env!("CARGO_BIN_EXE_tursoraft-proof");
 const ACCOUNTS: i64 = 50;
@@ -77,10 +77,14 @@ fn voters_and_leader_move_between_regions_under_load() {
 /// The move is then finished from Singapore by calling the same membership
 /// calls again, and the old leader restarted. Each round ends by moving back
 /// to Europe. Acknowledged async transfers may be lost; they are counted.
+///
+/// A new leader must follow within one election by a voter that can win,
+/// plus one more election timeout: see `election_bound`.
 #[test]
 fn the_old_leader_killed_in_the_middle_of_the_move() {
     run(async {
         let mut c = start_geo().await;
+        let bound = election_bound();
         let loads = Loads::start(&c, 2);
         for moment in [
             Moment::JointAppended,
@@ -123,6 +127,12 @@ fn the_old_leader_killed_in_the_middle_of_the_move() {
                 &attempts,
                 started,
                 done,
+            );
+            assert!(
+                elected <= bound,
+                "{moment:?}: a leader came {:.0} ms after the kill, more than {:.0} ms",
+                ms(elected),
+                ms(bound)
             );
             let quorum_missing: Vec<&String> = v
                 .missing_acknowledged
@@ -397,6 +407,19 @@ impl Moment {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
     }
+}
+
+/// The longest time from killing the leader until the running nodes name a
+/// new one. A follower campaigns once a leader lease (in openraft, the
+/// longest election timeout) and its own random election timeout have passed
+/// since it last heard from the leader. The bound allows one more election
+/// timeout, for two voters with the newest log that split the vote, and 1 s
+/// for the round trips of the pre-vote and the vote and for every node to
+/// hear from the new leader. Elections started by voters whose log is behind
+/// cannot win, and each one costs a whole election timeout more.
+fn election_bound() -> Duration {
+    let t = RaftTimeouts::for_max_rtt(delays(1.0).max_rtt());
+    Duration::from_millis(3 * t.election_timeout_max_ms + 1000)
 }
 
 /// Starts the six nodes, makes Europe the voters and Asia non-voting

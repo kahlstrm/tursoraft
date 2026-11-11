@@ -118,6 +118,15 @@ impl Cluster {
         child.wait().unwrap();
     }
 
+    /// Kills node `id` if it runs and deletes its directory: the node loses
+    /// its log, its vote and its database file, as with a lost disk.
+    pub fn wipe(&mut self, id: NodeId) {
+        if self.procs.contains_key(&id) {
+            self.kill(id);
+        }
+        std::fs::remove_dir_all(self.dir.path().join(format!("node-{id}"))).unwrap();
+    }
+
     /// Sends SIGSTOP to node `id`.
     pub fn pause(&self, id: NodeId) {
         self.signal(id, "-STOP");
@@ -158,17 +167,27 @@ impl Cluster {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let mut leaders = BTreeSet::new();
+            let mut seen = Vec::new();
             for id in ids {
                 let client = self.client(*id).with_timeout(Duration::from_secs(2));
                 let status = client.raft().status().await;
-                leaders.insert(status.ok().and_then(|s| s.leader));
+                leaders.insert(status.as_ref().ok().and_then(|s| s.leader));
+                seen.push(status.map(|s| {
+                    format!(
+                        "node {id}: {} term {} leader {:?} voters {:?} last {:?} applied {:?}",
+                        s.state, s.term, s.leader, s.voters, s.last_log_index, s.applied
+                    )
+                }));
             }
             if let [Some(leader)] = leaders.into_iter().collect::<Vec<_>>()[..] {
                 if ids.contains(&leader) {
                     return leader;
                 }
             }
-            assert!(Instant::now() < deadline, "no common leader among {ids:?}");
+            assert!(
+                Instant::now() < deadline,
+                "no common leader among {ids:?}: {seen:#?}"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }

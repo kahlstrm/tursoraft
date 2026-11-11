@@ -1,10 +1,23 @@
 // The pages the Worker renders, and all the SQL they run. To point the
 // pages at another schema, change this file only.
 //
-// The tables are those of the store in `crates/shop`:
-// `products(product_id INTEGER PRIMARY KEY, title, price_cents, stock)`.
+// The tables are those of the store in `crates/shop` (`SCHEMA` in
+// `crates/shop/src/store.rs`). `products.stock` is the stock at setup, not
+// what is left. What is left depends on how the store was set up, which
+// `shop_meta` records: designs `counter` and `leader` keep a counter in
+// `stock.available`, and design `units` keeps one row of `units` per unit
+// for sale. The store's own pages read it the same way (`Store::catalog`,
+// `Store::product`).
 
 export type Query = { sql: string; params: SqlStorageValue[] };
+
+/// One product with the stock still for sale, in every design.
+const PRODUCTS = `SELECT p.product_id, p.title, p.price_cents,
+    CASE (SELECT value FROM shop_meta WHERE key = 'reserve')
+      WHEN 'units' THEN (SELECT COUNT(*) FROM units u WHERE u.product_id = p.product_id)
+      ELSE s.available
+    END AS available
+  FROM products p JOIN stock s ON s.product_id = p.product_id`;
 export type Rows = Record<string, SqlStorageValue>[];
 
 export type Page = {
@@ -19,8 +32,7 @@ export function page(path: string): Page | null {
   if (path === "/") {
     return {
       query: {
-        sql: `SELECT product_id, title, price_cents, stock FROM products
-              ORDER BY product_id LIMIT 200`,
+        sql: `${PRODUCTS} ORDER BY p.product_id LIMIT 200`,
         params: [],
       },
       render: (rows) =>
@@ -33,7 +45,7 @@ ${rows
   .map(
     (r) =>
       `<tr><td><a href="/products/${html(r.product_id)}">${html(r.title)}</a></td>` +
-      `<td>${price(r.price_cents)}</td><td>${html(r.stock)}</td></tr>`,
+      `<td>${price(r.price_cents)}</td><td>${html(r.available)}</td></tr>`,
   )
   .join("\n")}
 </table>`,
@@ -44,8 +56,7 @@ ${rows
   if (product) {
     return {
       query: {
-        sql: `SELECT product_id, title, price_cents, stock FROM products
-              WHERE product_id = CAST(? AS INTEGER)`,
+        sql: `${PRODUCTS} WHERE p.product_id = CAST(? AS INTEGER)`,
         params: [product[1]],
       },
       render: ([r]) =>
@@ -55,7 +66,7 @@ ${rows
               String(r.title),
               `<h1>${html(r.title)}</h1>
 <p class="price">${price(r.price_cents)}</p>
-<p class="stock">${html(r.stock)} in stock</p>
+<p>In stock: <b id="stock">${html(r.available)}</b></p>
 <p><a href="/">All products</a></p>`,
             ),
     };

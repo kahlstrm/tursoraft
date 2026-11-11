@@ -72,28 +72,84 @@ async function dump(name) {
   return JSON.parse(res.text);
 }
 
-const PRODUCTS =
-  "CREATE TABLE products(product_id INTEGER PRIMARY KEY, title TEXT NOT NULL, price_cents INTEGER NOT NULL, stock INTEGER NOT NULL)";
+// The store's tables (crates/shop/src/store.rs) that the pages read.
+const STORE_SCHEMA = [
+  {
+    type: "table",
+    name: "shop_meta",
+    sql: "CREATE TABLE shop_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+  },
+  {
+    type: "table",
+    name: "products",
+    sql: "CREATE TABLE products(product_id INTEGER PRIMARY KEY, title TEXT NOT NULL, price_cents INTEGER NOT NULL, stock INTEGER NOT NULL)",
+  },
+  {
+    type: "table",
+    name: "stock",
+    sql: "CREATE TABLE stock(product_id INTEGER PRIMARY KEY, available INTEGER NOT NULL)",
+  },
+  {
+    type: "table",
+    name: "units",
+    sql: "CREATE TABLE units(unit_id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL)",
+  },
+  {
+    type: "index",
+    name: "units_by_product",
+    sql: "CREATE INDEX units_by_product ON units(product_id, unit_id)",
+  },
+];
+const TEA_COFFEE = [
+  { id: 1, title: "Tea", price: 250, stock: 10, available: 10 },
+  { id: 2, title: "Coffee", price: 300, stock: 5, available: 5 },
+];
 
-/// Copies a database with products 1 and 2 at log index `index`.
-async function copyProducts(relay, index) {
-  for (const message of [
+/// The messages of a copy at log index `index` of a store set up with
+/// `reserve`, holding `products`. In design `units`, `available` units of
+/// each product are rows of `units` and the counter stays 0.
+function storeCopy(index, products, reserve = "counter") {
+  const i = (n) => ({ i: String(n) });
+  const units = reserve === "units";
+  return [
     {
       t: "copy_begin",
       index,
-      schema: [{ type: "table", name: "products", sql: PRODUCTS }],
-      tables: [{ name: "products", columns: 4 }],
+      schema: STORE_SCHEMA,
+      tables: [
+        { name: "shop_meta", columns: 2 },
+        { name: "products", columns: 4 },
+        { name: "stock", columns: 2 },
+        { name: "units", columns: 2 },
+      ],
+    },
+    { t: "copy_rows", table: 0, rows: [[i(1), "reserve", reserve]] },
+    {
+      t: "copy_rows",
+      table: 1,
+      rows: products.map((p) => [i(p.id), i(p.id), p.title, i(p.price), i(p.stock)]),
     },
     {
       t: "copy_rows",
-      table: 0,
-      rows: [
-        [{ i: "1" }, { i: "1" }, "Tea", { i: "250" }, { i: "10" }],
-        [{ i: "2" }, { i: "2" }, "Coffee", { i: "300" }, { i: "5" }],
-      ],
+      table: 2,
+      rows: products.map((p) => [i(p.id), i(p.id), i(units ? 0 : p.available)]),
+    },
+    {
+      t: "copy_rows",
+      table: 3,
+      rows: units
+        ? products.flatMap((p) =>
+            Array.from({ length: p.available }, (_, n) => [i(p.id * 1e6 + n), i(p.id * 1e6 + n), i(p.id)]),
+          )
+        : [],
     },
     { t: "copy_end" },
-  ]) {
+  ];
+}
+
+/// Copies a store with products 1 and 2 at log index `index`.
+async function copyProducts(relay, index, products = TEA_COFFEE, reserve = "counter") {
+  for (const message of storeCopy(index, products, reserve)) {
     const reply = await relay.send(message);
     assert.equal(reply.t, "ack", JSON.stringify(reply));
   }
@@ -197,28 +253,11 @@ test("a copy is not visible until its last message", async () => {
   assert.equal(page.status, 200);
   assert.match(page.text, /Tea/);
   assert.equal(page.through, "10");
-  // A new copy without Tea, sent halfway.
-  assert.equal(
-    (
-      await relay.send({
-        t: "copy_begin",
-        index: 20,
-        schema: [{ type: "table", name: "products", sql: PRODUCTS }],
-        tables: [{ name: "products", columns: 4 }],
-      })
-    ).t,
-    "ack",
-  );
-  assert.equal(
-    (
-      await relay.send({
-        t: "copy_rows",
-        table: 0,
-        rows: [[{ i: "7" }, { i: "7" }, "Juice", { i: "200" }, { i: "3" }]],
-      })
-    ).t,
-    "ack",
-  );
+  // A new copy without Tea, sent up to its last message.
+  const juice = storeCopy(20, [{ id: 7, title: "Juice", price: 200, stock: 3, available: 3 }]);
+  for (const message of juice.slice(0, -1)) {
+    assert.equal((await relay.send(message)).t, "ack");
+  }
   page = await get("/");
   assert.match(page.text, /Tea/);
   assert.doesNotMatch(page.text, /Juice/);
@@ -247,7 +286,8 @@ test("after a failed message the stream is refused until a new copy", async () =
   // Nothing of it was kept, and the next message of the stream is refused.
   reply = await relay.send({ t: "changes", events: [], through: 12 });
   assert.equal(reply.t, "error");
-  assert.match(reply.message, /expected message 4/);
+  // The copy was messages 1 to 6, and message 7 failed.
+  assert.match(reply.message, /expected message 7 /);
   let state = await dump("broken");
   assert.equal(state.through, 10);
   assert.equal(state.tables.products.rows.length, 2);
@@ -310,6 +350,27 @@ test("foreign-key actions do not run while applying", async () => {
   assert.deepEqual(tables.child.rows, [[{ i: "11" }, { i: "99" }]]);
 });
 
+test("pages show the stock left, not the stock at setup, in every design of the store", async () => {
+  // Counters (designs counter and leader): what is left is stock.available.
+  // Units (design units): what is left is the number of rows of units.
+  for (const reserve of ["counter", "leader", "units"]) {
+    const name = `design-${reserve}`;
+    const relay = await connect(name);
+    const products = [
+      { id: 0, title: "Flash", price: 4900, stock: 9, available: 4 },
+      { id: 5, title: "Soap", price: 120, stock: 3, available: 0 },
+    ];
+    await copyProducts(relay, 3, products, reserve);
+    const flash = await get(`/products/0?follower=${name}`);
+    assert.equal(flash.status, 200, flash.text);
+    assert.match(flash.text, /<b id="stock">4<\/b>/, reserve);
+    const soap = await get(`/products/5?follower=${name}`);
+    assert.match(soap.text, /<b id="stock">0<\/b>/, reserve);
+    const home = await get(`/?follower=${name}`);
+    assert.match(home.text, /Flash<\/a><\/td><td>[^<]*<\/td><td>4<\/td>/, reserve);
+  }
+});
+
 test("a read waits until the follower has applied its log index", async () => {
   const relay = await connect("waits");
   await copyProducts(relay, 5);
@@ -319,7 +380,10 @@ test("a read waits until the follower has applied its log index", async () => {
   await new Promise((r) => setTimeout(r, 300));
   assert.equal(done, false, "the read did not wait");
   // Entry 6 arrives in two messages; the read waits for the whole entry.
-  const cocoa = insert("products", 3, [{ i: "3" }, "Cocoa <hot>", { i: "100" }, { i: "1" }]);
+  const cocoa = [
+    insert("products", 3, [{ i: "3" }, "Cocoa <hot>", { i: "100" }, { i: "1" }]),
+    insert("stock", 3, [{ i: "3" }, { i: "1" }]),
+  ];
   assert.equal(
     (await relay.send({ t: "changes", events: [{ index: 6, position: 0, rows: [] }], through: 5 })).t,
     "ack",
@@ -327,12 +391,13 @@ test("a read waits until the follower has applied its log index", async () => {
   await new Promise((r) => setTimeout(r, 200));
   assert.equal(done, false, "the read did not wait for the whole entry");
   assert.equal(
-    (await relay.send({ t: "changes", events: [{ index: 6, position: 1, rows: [cocoa] }], through: 6 })).t,
+    (await relay.send({ t: "changes", events: [{ index: 6, position: 1, rows: cocoa }], through: 6 })).t,
     "ack",
   );
   const page = await read;
   assert.equal(page.status, 200, page.text);
   assert.match(page.text, /<h1>Cocoa &lt;hot&gt;<\/h1>/);
+  assert.match(page.text, /<b id="stock">1<\/b>/);
   assert.equal(page.through, "6");
   const late = await get("/?follower=waits&at=7&wait_ms=200");
   assert.equal(late.status, 504);

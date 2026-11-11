@@ -162,6 +162,25 @@ async fn pages_show_committed_writes_and_reads_wait_for_their_index() {
     let edge = Edge::start().await;
     let relay = edge.relay(c.node(other), FOLLOWER);
     wait_copies(&relay, 1).await;
+    // The pages read the tables of the store in crates/shop, which keeps
+    // its design in `shop_meta` and the stock left in `stock` (or, in
+    // design `units`, in `units`).
+    write(
+        c.node(leader),
+        vec![
+            Statement::from("CREATE TABLE shop_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)"),
+            Statement::from(
+                "CREATE TABLE stock(product_id INTEGER PRIMARY KEY, available INTEGER NOT NULL)",
+            ),
+            Statement::from(
+                "CREATE TABLE units(unit_id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL)",
+            ),
+            Statement::from("INSERT INTO shop_meta VALUES ('reserve', 'counter')"),
+            Statement::from("INSERT INTO stock SELECT product_id, stock - 1 FROM products"),
+        ],
+    )
+    .await
+    .unwrap();
     let index = write(
         c.node(leader),
         vec![st(
@@ -191,10 +210,13 @@ async fn pages_show_committed_writes_and_reads_wait_for_their_index() {
     assert!(!read.is_finished(), "the read did not wait");
     let index = write(
         c.node(leader),
-        vec![st(
-            "INSERT INTO products VALUES (42, 'The answer', 4200, 7)",
-            vec![],
-        )],
+        vec![
+            st(
+                "INSERT INTO products VALUES (42, 'The answer', 4200, 9)",
+                vec![],
+            ),
+            st("INSERT INTO stock VALUES (42, 7)", vec![]),
+        ],
     )
     .await
     .unwrap();
@@ -202,7 +224,7 @@ async fn pages_show_committed_writes_and_reads_wait_for_their_index() {
     let (status, body) = read.await.unwrap();
     assert_eq!(status, 200, "{body}");
     assert!(body.contains("<h1>The answer</h1>"), "{body}");
-    assert!(body.contains("7 in stock"), "{body}");
+    assert!(body.contains(r#"<b id="stock">7</b>"#), "{body}");
 
     // One that never gets there times out.
     let (status, _, through) = edge

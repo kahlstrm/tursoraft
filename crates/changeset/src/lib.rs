@@ -369,6 +369,7 @@ impl AheadDb {
             conn.execute("ROLLBACK")?;
         }
         let (mut results, ended) = result?;
+        restart_wal_if_long(&conn)?;
         if let Some(by) = ended {
             for r in &mut results[..by] {
                 if r.is_ok() {
@@ -395,13 +396,32 @@ impl AheadDb {
             raft_meta: applied.raft_meta,
             proposals: change_sets.to_vec(),
         };
-        self.db.shared.apply_locked(&entry, true, false)
+        let outcomes = self.db.shared.apply_locked(&entry, true, false)?;
+        restart_wal_if_long(&write)?;
+        Ok(outcomes)
     }
 
     /// A connection to this file, for checks. It must not write.
     pub fn connect(&self) -> Result<Arc<Connection>, Error> {
         self.db.connect()
     }
+}
+
+/// The ahead file's WAL length, in frames, at which it is copied into the
+/// file and started over.
+const AHEAD_WAL_FRAMES: u64 = 500;
+
+/// Copies the ahead file's WAL into the file and starts it over once it
+/// holds [`AHEAD_WAL_FRAMES`]. Turso's automatic checkpoints never start the
+/// WAL over when commits are not synced: frames copied without an fsync do
+/// not count as copied. Without this the WAL grows with every capture, and
+/// each automatic checkpoint copies all of it again, so a capture costs more
+/// the more were captured before it.
+fn restart_wal_if_long(conn: &Arc<Connection>) -> Result<(), Error> {
+    if conn.wal_state()?.max_frame >= AHEAD_WAL_FRAMES {
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    }
+    Ok(())
 }
 
 fn check_allowed(index: usize, sql: &str) -> Result<(), Error> {

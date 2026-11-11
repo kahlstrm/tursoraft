@@ -649,6 +649,35 @@ fn groups_captured_ahead_apply_in_order() {
     p.assert_same();
 }
 
+/// The ahead file's WAL stays short however many transactions it took, both
+/// through capture and through change sets from elsewhere. Its commits are
+/// not synced, and Turso then never starts the WAL over on its own; a WAL
+/// that only grows makes every capture slower than the one before.
+#[test]
+fn the_ahead_file_wal_stays_short() {
+    let p = Pair::new(&["CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)"]);
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("ahead.db");
+    let ahead = AheadDb::open(&path).unwrap();
+    ahead.reset(&p.a.db).unwrap();
+    let wal_bytes = || std::fs::metadata(path.with_extension("db-wal")).map_or(0, |m| m.len());
+    // Without the restart, each loop adds about 5 MB.
+    let limit = 4 << 20;
+    for n in 0..600 {
+        let insert = format!("INSERT INTO t VALUES ({n}, 'ahead')");
+        let captured = ahead.capture_batch(&[vec![insert.as_str().into()]]);
+        captured.unwrap().pop().unwrap().unwrap();
+    }
+    assert!(wal_bytes() < limit, "after captures: {} bytes", wal_bytes());
+    for n in 600..1200 {
+        let change_set = p.capture(&[&format!("INSERT INTO t VALUES ({n}, 'elsewhere')")]);
+        assert_eq!(ahead.apply_incoming(&[change_set]).unwrap(), vec![APPLIED]);
+    }
+    assert!(wal_bytes() < limit, "after incoming: {} bytes", wal_bytes());
+    let count = query(&ahead.connect().unwrap(), "SELECT count(*) FROM t");
+    assert_eq!(count, vec![vec![i(1200)]]);
+}
+
 /// A change set that read pending change sets is rejected once one of them
 /// is: here a change set from elsewhere comes first and makes the first
 /// group lose a write conflict, so the groups captured on top of it read a

@@ -15,11 +15,11 @@ tursoraft-statemachine = { path = "crates/statemachine" }
 tursoraft-changeset = { path = "crates/changeset" }
 tursoraft-raft = { path = "crates/raft" }
 
-# Turso Database from the enclosing checkout (0c9fe0dd94c14a4f00106bffa9c9433d5965fd3a,
-# version 0.9.0-pre.5).
-turso_core = { path = "../core" }
-turso_sqlite = { path = "../sqlite/frontend" }
-turso_sync_engine = { path = "../sync/engine" }
+# Turso Database at 0c9fe0dd94c14a4f00106bffa9c9433d5965fd3a (version 0.9.0-pre.5).
+turso_core = { git = "https://github.com/tursodatabase/turso", rev = "0c9fe0dd94c14a4f00106bffa9c9433d5965fd3a" }
+turso_parser = { git = "https://github.com/tursodatabase/turso", rev = "0c9fe0dd94c14a4f00106bffa9c9433d5965fd3a" }
+turso_sqlite = { git = "https://github.com/tursodatabase/turso", rev = "0c9fe0dd94c14a4f00106bffa9c9433d5965fd3a" }
+turso_sync_engine = { git = "https://github.com/tursodatabase/turso", rev = "0c9fe0dd94c14a4f00106bffa9c9433d5965fd3a" }
 
 # 0.10.0 is the stable line since 10 Nov 2026; it adds pipelined replication
 # and leadership transfer.

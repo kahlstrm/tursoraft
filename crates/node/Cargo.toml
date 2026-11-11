@@ -15,7 +15,7 @@ tursoraft-statemachine.workspace = true
 tursoraft-changeset.workspace = true
 tursoraft-raft.workspace = true
 # Recognizes statements the read path accepts.
-turso_parser = { path = "../../../sqlite/parser" }
+turso_parser.workspace = true
 openraft.workspace = true
 serde.workspace = true
 thiserror.workspace = true

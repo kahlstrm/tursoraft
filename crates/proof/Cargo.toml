@@ -1,0 +1,22 @@
+[package]
+name = "tursoraft-proof"
+description = "Failure tests and a latency benchmark of tursoraft clusters, through the public API only"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "tursoraft-proof"
+path = "src/main.rs"
+
+[dependencies]
+tursoraft-node = { path = "../node" }
+tursoraft-raft.workspace = true
+tursoraft-changeset.workspace = true
+tursoraft-statemachine.workspace = true
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

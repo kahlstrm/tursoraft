@@ -2268,6 +2268,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tursoraft-proof"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing-subscriber",
+ "tursoraft-changeset",
+ "tursoraft-node",
+ "tursoraft-raft",
+ "tursoraft-statemachine",
+]
+
+[[package]]
 name = "tursoraft-raft"
 version = "0.1.0"
 dependencies = [

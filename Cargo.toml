@@ -2,7 +2,7 @@
 # Resolver 3 picks dependency versions that support `rust-version` below.
 # With resolver 2, roaring and uuid resolve to versions that need rustc 1.89+.
 resolver = "3"
-members = ["crates/statemachine", "crates/changeset", "crates/raft", "crates/node"]
+members = ["crates/statemachine", "crates/changeset", "crates/raft", "crates/node", "crates/proof"]
 
 [workspace.package]
 version = "0.1.0"

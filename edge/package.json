@@ -1,0 +1,17 @@
+{
+  "name": "tursoraft-edge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "tsc -p . && node --test test/*.test.mjs",
+    "check": "tsc -p .",
+    "bench": "node test/bench.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260730.1",
+    "esbuild": "0.28.2",
+    "miniflare": "4.20260730.0",
+    "typescript": "5.9.3",
+    "wrangler": "4.116.0"
+  }
+}

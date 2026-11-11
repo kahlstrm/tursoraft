@@ -1,0 +1,21 @@
+# Deploys the Worker and the follower Durable Object. Not deployed yet: the
+# tests run them under Miniflare (`npm test`).
+#
+#   npx wrangler secret put RELAY_SECRET
+#   npx wrangler deploy
+#
+# A relay then connects to wss://<worker host>/relay?follower=<name>.
+name = "tursoraft-edge"
+main = "src/index.ts"
+compatibility_date = "2026-07-30"
+
+[vars]
+FOLLOWER_NAME = "default"
+
+[[durable_objects.bindings]]
+name = "FOLLOWER"
+class_name = "Follower"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Follower"]

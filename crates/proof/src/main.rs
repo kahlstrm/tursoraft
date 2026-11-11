@@ -7,7 +7,7 @@
 //! tests and the benchmark start one process per node with it.
 //!
 //! `bench` runs the latency and throughput benchmark and prints its tables.
-//! Sections: `uniform`, `followers`, `geo`, `failover`. `--quick` runs a
+//! Sections: `uniform`, `followers`, `geo`, `failover`, `move`. `--quick` runs a
 //! small part of each, for checking that the benchmark works. `--pending`
 //! lists the values of `max_pending_groups` each table is measured with
 //! (default `1,256`: pipelining off, and the node's default).
@@ -78,7 +78,7 @@ fn usage(msg: &str) -> ! {
         "usage: tursoraft-proof node --config FILE --id N --dir DIR [--max-pending-groups N]"
     );
     eprintln!(
-        "       tursoraft-proof bench [--quick] [--only uniform,followers,geo,failover] [--pending 1,256]"
+        "       tursoraft-proof bench [--quick] [--only uniform,followers,geo,failover,move] [--pending 1,256]"
     );
     std::process::exit(2);
 }

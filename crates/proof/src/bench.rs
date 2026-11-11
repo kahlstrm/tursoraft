@@ -3,7 +3,7 @@
 //! insert). Run it with
 //!
 //! ```text
-//! cargo run --release -p tursoraft-proof -- bench [--quick] [--only uniform,followers,geo,failover] [--pending 1,256]
+//! cargo run --release -p tursoraft-proof -- bench [--quick] [--only uniform,followers,geo,failover,move] [--pending 1,256]
 //! ```
 //!
 //! Each cell starts its writers, discards a warm-up, then measures until it
@@ -40,9 +40,10 @@ use tursoraft_raft::{DelayTable, NodeId, PairRtt, RaftTimeouts};
 
 use crate::bank::{schema, Attempt, Load, LoadSpec};
 use crate::cluster::{ms, Cluster};
+use crate::moves::{self, move_voters, place, Moved, Seen, ALL, ASIA, EUROPE};
 
 const ACCOUNTS: i64 = 100;
-const SECTIONS: [&str; 4] = ["uniform", "followers", "geo", "failover"];
+const SECTIONS: [&str; 5] = ["uniform", "followers", "geo", "failover", "move"];
 
 pub fn main(args: &[String]) {
     let mut quick = false;
@@ -117,6 +118,7 @@ pub fn main(args: &[String]) {
                 "followers" => bench.followers().await,
                 "geo" => bench.geo().await,
                 "failover" => bench.failover().await,
+                "move" => bench.moves().await,
                 _ => unreachable!(),
             }
             println!("({section} took {:.0} s)\n", t.elapsed().as_secs_f64());
@@ -183,7 +185,7 @@ impl Bench {
                         for &w in writer_counts {
                             let tag = format!("u{rtt}-{mode:?}-{at_name}-{w}");
                             let m = self
-                                .measure(&c, leader, &followers, vec![(at, w)], mode, &tag)
+                                .measure(&c, leader, &followers, spec(&tag, vec![(at, w)], mode))
                                 .await;
                             println!(
                                 "| {rtt} | {pending} | {mode:?} | {at_name} | {w} {}",
@@ -233,7 +235,7 @@ impl Bench {
                 for &(mode, w) in cells {
                     let tag = format!("f{k}-{mode:?}-{w}");
                     let m = self
-                        .measure(&c, leader, &followers, vec![(leader, w)], mode, &tag)
+                        .measure(&c, leader, &followers, spec(&tag, vec![(leader, w)], mode))
                         .await;
                     println!("| {k} | {pending} | {mode:?} | {w} {}", m.row(&m.all));
                 }
@@ -317,7 +319,12 @@ impl Bench {
                 for &w in counts {
                     let tag = format!("g{leader}-{mode:?}-{w}");
                     let m = self
-                        .measure(&c, leader, &followers, vec![(1, w), (4, w)], mode, &tag)
+                        .measure(
+                            &c,
+                            leader,
+                            &followers,
+                            spec(&tag, vec![(1, w), (4, w)], mode),
+                        )
                         .await;
                     for place in [1u64, 4] {
                         table.push(format!(
@@ -409,18 +416,269 @@ impl Bench {
         println!();
     }
 
+    /// Moving the voters and the leader between Europe and Asia: write
+    /// latency before and after, what writers see during a move, and moves
+    /// to new nodes that start empty.
+    async fn moves(&self) {
+        let timeouts = RaftTimeouts::for_max_rtt(moves::delays(1.0).max_rtt());
+        println!("## Moving the voters and the leader from Europe to Asia\n");
+        println!(
+            "Nodes 1 Frankfurt, 2 Paris, 3 London, 4 Singapore, 5 Hong Kong, 6 Tokyo. Before: voters \
+             Europe, leader Frankfurt, Asia non-voting followers. After: voters Asia, leader Singapore, \
+             Europe non-voting followers. A move: wait until the new voters applied the leader's last \
+             entry, `change_voters`, `transfer_leader`. Timeouts: heartbeat {} ms, election {}..{} ms.\n",
+            timeouts.heartbeat_ms,
+            timeouts.election_timeout_min_ms,
+            timeouts.election_timeout_max_ms
+        );
+        let counts: &[usize] = if self.quick { &[1] } else { &[1, 16] };
+        let rounds = if self.quick { 1 } else { 3 };
+        let mut latency = Vec::new();
+        let mut moved = Vec::new();
+        for (i, &pending) in self.pendings.iter().enumerate() {
+            let mut c = self.cluster(&ALL, pending, |cfg| cfg.delays = moves::delays(1.0));
+            c.start_all();
+            let first = c.initialize(&EUROPE).await;
+            for id in ASIA {
+                c.client(first)
+                    .raft()
+                    .add_follower(id, c.addr(id))
+                    .await
+                    .unwrap();
+            }
+            c.client(1).raft().transfer_leader(1).await.unwrap();
+            create_schema(&c, 1).await;
+            c.converge(1, &ALL).await;
+            if i == 0 {
+                print_move_rtts(&c).await;
+            }
+            for round in 0..rounds {
+                for (leader, to, to_leader) in [(1, ASIA, 4), (4, EUROPE, 1)] {
+                    if round == 0 {
+                        latency.extend(self.move_latency(&c, leader, counts, pending).await);
+                    }
+                    moved.extend(self.measured_move(&c, &to, to_leader, pending, round).await);
+                }
+            }
+        }
+        println!("### Write latency before and after the move\n");
+        println!(
+            "One cell: `writers` writers in Frankfurt and as many in Singapore at once. \
+             `interactive`: `Client::begin`, read both balances, write them as values, commit in quorum mode.\n"
+        );
+        println!("| pending | voters | mode | writers per place | writer in {HEADER}");
+        println!("|---:|---|---|---:|---{RULE}");
+        for row in latency {
+            println!("{row}");
+        }
+        println!();
+        println!("### What writers see during a move\n");
+        println!(
+            "2 quorum, 2 async and 2 interactive writers in Frankfurt and in Singapore run through the move. \
+             `gap`: the longest time in which a place got no acknowledgement, from the start of the move \
+             to 1 s after its end; `gap before`: the same over an equally long window just before the move \
+             (at most 2.5 s). \
+             Counts are of answers in the move window.\n"
+        );
+        println!("| pending | to | catch-up ms | change_voters ms | transfer_leader ms | total ms | writer in | gap ms | gap before ms | acked | rejected | unavailable | unknown |");
+        println!("|---:|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|");
+        for row in moved {
+            println!("{row}");
+        }
+        println!();
+        self.moves_to_new_nodes().await;
+    }
+
+    /// Rows of the latency table with `leader` leading.
+    async fn move_latency(
+        &self,
+        c: &Cluster,
+        leader: NodeId,
+        counts: &[usize],
+        pending: usize,
+    ) -> Vec<String> {
+        let followers: Vec<NodeId> = ALL.into_iter().filter(|n| *n != leader).collect();
+        let voters = if leader == 1 { "Europe" } else { "Asia" };
+        let mut rows = Vec::new();
+        for (name, mode, interactive) in [
+            ("Quorum", CommitMode::Quorum, false),
+            ("Async", CommitMode::Async, false),
+            ("interactive", CommitMode::Quorum, true),
+        ] {
+            for &w in counts {
+                let mut spec = spec(&format!("m{leader}-{name}-{w}"), vec![(1, w), (4, w)], mode);
+                spec.interactive = interactive;
+                let m = self.measure(c, leader, &followers, spec).await;
+                for at in [1, 4] {
+                    rows.push(format!(
+                        "| {pending} | {voters} | {name} | {w} | {} {}",
+                        place(at),
+                        m.row(&m.by_node[&at])
+                    ));
+                }
+            }
+        }
+        rows
+    }
+
+    /// Moves the voters to `voters` and the leader to `leader` under a mixed
+    /// load, and returns one row per writing place. `round` keeps the
+    /// transfer keys of repeated moves apart.
+    async fn measured_move(
+        &self,
+        c: &Cluster,
+        voters: &[NodeId],
+        leader: NodeId,
+        pending: usize,
+        round: usize,
+    ) -> Vec<String> {
+        let loads: Vec<Load> = [
+            (CommitMode::Quorum, false),
+            (CommitMode::Async, false),
+            (CommitMode::Quorum, true),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (mode, interactive))| {
+            let mut spec = spec(
+                &format!("mv{round}-{leader}-{i}"),
+                vec![(1, 2), (4, 2)],
+                mode,
+            );
+            spec.interactive = interactive;
+            Load::start(c, &spec)
+        })
+        .collect();
+        let steady = Instant::now() + Duration::from_millis(500);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let start = Instant::now();
+        let m = move_voters(c, voters, leader, true).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let end = Instant::now();
+        let mut attempts = Vec::new();
+        for load in loads {
+            attempts.extend(load.stop().await.attempts);
+        }
+        let to = if leader == 1 { "Europe" } else { "Asia" };
+        [1, 4]
+            .into_iter()
+            .map(|at| {
+                let during = Seen::of(&attempts, |a| a.node == at, start, end);
+                let from = steady.max(start - (end - start));
+                let before = Seen::of(&attempts, |a| a.node == at, from, start);
+                format!(
+                    "| {pending} | {to} | {} | {} | {:.0} | {:.0} | {} | {} | {} | {} |",
+                    move_times(&m),
+                    place(at),
+                    ms(during.longest_gap),
+                    ms(before.longest_gap),
+                    during.acked,
+                    during.rejected,
+                    during.unavailable,
+                    during.unknown
+                )
+            })
+            .collect()
+    }
+
+    /// Moves the voters from Europe to Asian nodes that start empty, once
+    /// waiting until they caught up before `change_voters` and once not.
+    async fn moves_to_new_nodes(&self) {
+        let (txs, rows) = if self.quick { (5, 100) } else { (25, 200) };
+        println!("### Moving to new nodes that start empty\n");
+        println!(
+            "The database holds about {} MB of 4 KB blobs. The Asian nodes run but are not members. \
+             At the start of the move they are added as non-voting followers, then moved to as above, \
+             either after waiting until they applied the leader's last entry or at once. 2 quorum and \
+             2 async writers in Frankfurt. `gap`: the longest time without an acknowledgement in Frankfurt \
+             from the start of the move to 1 s after its end; `gap before`: the same over at most 2.5 s just \
+             before the move. `db MB`: the leader's database file and its WAL.\n",
+            txs * rows * 4 / 1000
+        );
+        println!("| pending | catch up first | db MB | add ms | catch-up ms | change_voters ms | transfer_leader ms | total ms | quorum gap ms | gap before ms | async gap ms | unavailable | unknown |");
+        println!("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+        for &pending in &self.pendings {
+            for wait in [true, false] {
+                let mut c = self.cluster(&ALL, pending, |cfg| cfg.delays = moves::delays(1.0));
+                c.start_all();
+                c.initialize(&EUROPE).await;
+                c.client(1).raft().transfer_leader(1).await.unwrap();
+                create_schema(&c, 1).await;
+                let client = c.client(1);
+                client
+                    .execute(
+                        vec!["CREATE TABLE pad(id INTEGER PRIMARY KEY, b BLOB)".into()],
+                        CommitMode::Quorum,
+                    )
+                    .await
+                    .unwrap();
+                let values = vec!["(randomblob(4096))"; rows].join(", ");
+                for _ in 0..txs {
+                    client
+                        .execute(
+                            vec![tursoraft_node::Statement::new(
+                                format!("INSERT INTO pad(b) VALUES {values}"),
+                                Vec::new(),
+                            )],
+                            CommitMode::Quorum,
+                        )
+                        .await
+                        .unwrap();
+                }
+                c.converge(1, &EUROPE).await;
+                let db_mb = ["data.db", "data.db-wal"]
+                    .iter()
+                    .filter_map(|f| std::fs::metadata(c.dir.path().join("node-1").join(f)).ok())
+                    .map(|m| m.len() as f64 / 1e6)
+                    .sum::<f64>();
+                let loads: Vec<Load> = [CommitMode::Quorum, CommitMode::Async]
+                    .into_iter()
+                    .map(|mode| Load::start(&c, &spec(&format!("n{mode:?}"), vec![(1, 2)], mode)))
+                    .collect();
+                let steady = Instant::now() + Duration::from_millis(500);
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let start = Instant::now();
+                for id in ASIA {
+                    client.raft().add_follower(id, c.addr(id)).await.unwrap();
+                }
+                let added = start.elapsed();
+                let m = move_voters(&c, &ASIA, 4, wait).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let end = Instant::now();
+                let mut attempts = Vec::new();
+                for load in loads {
+                    attempts.extend(load.stop().await.attempts);
+                }
+                let quorum = |a: &Attempt| a.key.starts_with("nQuorum");
+                let during = Seen::of(&attempts, quorum, start, end);
+                let before = Seen::of(&attempts, quorum, steady.max(start - (end - start)), start);
+                let asynchronous = Seen::of(&attempts, |a| !quorum(a), start, end);
+                println!(
+                    "| {pending} | {} | {db_mb:.0} | {:.0} | {} | {:.0} | {:.0} | {:.0} | {} | {} |",
+                    if wait { "yes" } else { "no" },
+                    ms(added),
+                    move_times(&m),
+                    ms(during.longest_gap),
+                    ms(before.longest_gap),
+                    ms(asynchronous.longest_gap),
+                    during.unavailable + asynchronous.unavailable,
+                    during.unknown + asynchronous.unknown,
+                );
+            }
+        }
+        println!();
+    }
+
     async fn measure(
         &self,
         c: &Cluster,
         leader: NodeId,
         followers: &[NodeId],
-        writers: Vec<(NodeId, usize)>,
-        mode: CommitMode,
-        tag: &str,
+        spec: LoadSpec,
     ) -> Measured {
         let t = self.timing;
         let before = c.client(leader).stats().await.unwrap();
-        let load = Load::start(c, &LoadSpec::new(tag, writers, mode, ACCOUNTS));
+        let load = Load::start(c, &spec);
         tokio::time::sleep(t.warmup).await;
         let start = Instant::now();
         let stop_lag = Arc::new(AtomicBool::new(false));
@@ -485,6 +743,35 @@ impl Bench {
             resets: after.resets - before.resets,
         }
     }
+}
+
+/// The step times of a move as four table cells.
+fn move_times(m: &Moved) -> String {
+    format!(
+        "{:.0} | {:.0} | {:.0} | {:.0}",
+        ms(m.catch_up),
+        ms(m.change),
+        ms(m.transfer),
+        ms(m.total)
+    )
+}
+
+async fn print_move_rtts(c: &Cluster) {
+    println!("Round trips from cloudping.co (AWS P50, both directions averaged) / as measured here (ms):\n");
+    println!("| pair | configured | measured |");
+    println!("|---|---:|---:|");
+    for &(a, b, rtt) in &moves::RTTS {
+        let mut best = Duration::MAX;
+        for _ in 0..5 {
+            best = best.min(c.client(a).raft().ping_peer(b).await.unwrap());
+        }
+        println!("| {} – {} | {rtt} | {:.1} |", place(a), place(b), ms(best));
+    }
+    println!();
+}
+
+fn spec(tag: &str, writers: Vec<(NodeId, usize)>, mode: CommitMode) -> LoadSpec {
+    LoadSpec::new(tag, writers, mode, ACCOUNTS)
 }
 
 async fn print_rtts(c: &Cluster, pairs: &[(NodeId, NodeId, f64)]) {

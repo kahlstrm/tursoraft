@@ -14,6 +14,7 @@
 //!                                                                  # async loss, and the stale-answer defect
 //! cargo run --release -p tursoraft-proof -- bench                 # the benchmark tables (about 25 min)
 //! cargo run --release -p tursoraft-proof -- bench --quick         # a small part of each table (about 1 min)
+//! cargo run --release -p tursoraft-proof -- bench --only move     # moving the voters between regions
 //! ```
 
 pub mod bank;

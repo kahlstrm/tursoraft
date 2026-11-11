@@ -38,7 +38,8 @@ onto another database with the sync engine's `DatabaseReplaySession`
 `tursoraft-shop serve` runs one store instance: a tursoraft node and an
 HTTP server in one process. `tursoraft-shop load` drives an instance with
 shoppers and a flash sale, and `tursoraft-shop check` checks afterwards that
-nothing was lost or oversold.
+nothing was lost or oversold. `deploy/` runs it on one machine or on real
+machines; see `deploy/README.md`.
 
 Public port (`--http`):
 

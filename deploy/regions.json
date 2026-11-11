@@ -1,0 +1,29 @@
+{
+  "comment": "One machine per node. Voters near each other in Europe, non-voting followers far away. local_rtt_ms are estimated round trips that the local stand-in (local.sh) injects; on real machines the delay table stays empty and deploy.sh measures the real round trips.",
+  "server_type": "ccx13",
+  "image": "debian-13",
+  "raft_port": 7001,
+  "http_port": 8080,
+  "admin_port": 8081,
+  "wireguard_port": 51820,
+  "wireguard_net": "10.77.0",
+  "timeouts": {
+    "heartbeat_ms": 400,
+    "election_timeout_min_ms": 2000,
+    "election_timeout_max_ms": 4000,
+    "install_snapshot_ms": 30000
+  },
+  "nodes": [
+    {"id": 1, "name": "fsn", "location": "fsn1", "role": "voter"},
+    {"id": 2, "name": "nbg", "location": "nbg1", "role": "voter"},
+    {"id": 3, "name": "hel", "location": "hel1", "role": "voter"},
+    {"id": 4, "name": "ash", "location": "ash", "role": "follower"},
+    {"id": 5, "name": "sin", "location": "sin", "role": "follower"}
+  ],
+  "local_rtt_ms": [
+    ["fsn", "nbg", 4], ["fsn", "hel", 24], ["nbg", "hel", 25],
+    ["fsn", "ash", 92], ["nbg", "ash", 95], ["hel", "ash", 115],
+    ["fsn", "sin", 163], ["nbg", "sin", 165], ["hel", "sin", 200],
+    ["ash", "sin", 220]
+  ]
+}

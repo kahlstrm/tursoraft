@@ -10,6 +10,12 @@
 //! - any change set at an older schema epoch, because rows captured before a
 //!   schema change may not fit the current tables.
 //!
+//! Before that, a change set that read pending change sets
+//! ([`ChangeSet::reads_pending`]) is rejected when any change set after its
+//! base was rejected before it: one of those it read never took effect. The
+//! index of the last entry with a rejected change set is stored with the
+//! applied position, so every node decides this from its file and the log.
+//!
 //! Each row is checked once per change set, the first time the change set
 //! touches it; later records of the same row follow from the earlier ones.
 //! The rows of a run of row records between two schema records are all
@@ -58,7 +64,7 @@ pub(crate) async fn apply_entry(
     // Foreign keys are checked as they were at capture, so a proposal whose
     // parent row an earlier proposal deleted is rejected.
     conn.set_foreign_keys_enabled(true);
-    let mut epoch = crate::read_schema_epoch(&conn)?;
+    let (mut epoch, mut last_rejected) = crate::read_counters(&conn)?;
     let mut applier = Applier {
         conn: conn.clone(),
         check,
@@ -67,51 +73,55 @@ pub(crate) async fn apply_entry(
     };
     let mut outcomes = Vec::with_capacity(entry.proposals.len());
     for proposal in &entry.proposals {
-        let change_set = match ChangeSet::decode(proposal) {
-            Ok(change_set) => change_set,
-            Err(e) => {
-                outcomes.push(Outcome::Rejected {
-                    reason: e.to_string(),
-                });
-                continue;
+        let rejected = match ChangeSet::decode(proposal) {
+            Err(e) => Some(e.to_string()),
+            Ok(change_set) if change_set.reads_pending && last_rejected > change_set.base_index => {
+                Some(format!(
+                    "it read change sets that were not applied yet, and one after its base \
+                     index {} was rejected (in entry {last_rejected})",
+                    change_set.base_index
+                ))
+            }
+            Ok(change_set) if check && change_set.schema_epoch != epoch => Some(format!(
+                "schema changed after the transaction read it: captured at schema epoch {}, \
+                 the database is at schema epoch {epoch}",
+                change_set.schema_epoch
+            )),
+            Ok(change_set) => {
+                conn.execute("SAVEPOINT proposal")?;
+                let result = applier
+                    .apply_change_set(&coro, &mut session, &change_set)
+                    .await;
+                let rejected = match result {
+                    Ok(()) => {
+                        if change_set.changes_schema() {
+                            epoch += 1;
+                        }
+                        None
+                    }
+                    Err(e) if is_rejection(&e) => {
+                        applier.forget();
+                        conn.execute("ROLLBACK TO proposal")?;
+                        Some(e.to_string())
+                    }
+                    Err(e) => return Err(e),
+                };
+                conn.execute("RELEASE proposal")?;
+                rejected
             }
         };
-        if check && change_set.schema_epoch != epoch {
-            outcomes.push(Outcome::Rejected {
-                reason: format!(
-                    "schema changed after the transaction read it: captured at schema epoch {}, \
-                     the database is at schema epoch {epoch}",
-                    change_set.schema_epoch
-                ),
-            });
-            continue;
-        }
-        conn.execute("SAVEPOINT proposal")?;
-        match applier
-            .apply_change_set(&coro, &mut session, &change_set)
-            .await
-        {
-            Ok(()) => {
-                if change_set.changes_schema() {
-                    epoch += 1;
-                }
-                outcomes.push(Outcome::Applied);
+        outcomes.push(match rejected {
+            None => Outcome::Applied,
+            Some(reason) => {
+                last_rejected = entry.index;
+                Outcome::Rejected { reason }
             }
-            Err(e) if is_rejection(&e) => {
-                applier.forget();
-                conn.execute("ROLLBACK TO proposal")?;
-                outcomes.push(Outcome::Rejected {
-                    reason: e.to_string(),
-                });
-            }
-            Err(e) => return Err(e),
-        }
-        conn.execute("RELEASE proposal")?;
+        });
     }
     applier.forget();
     let mut stmt = conn.prepare(format!(
-        "INSERT OR REPLACE INTO {APPLIED_TABLE}(id, log_index, raft_meta, schema_epoch) \
-         VALUES (0, ?, ?, ?)"
+        "INSERT OR REPLACE INTO {APPLIED_TABLE}(id, log_index, raft_meta, schema_epoch, \
+         last_rejected) VALUES (0, ?, ?, ?, ?)"
     ))?;
     stmt.bind_at(
         NonZero::new(1).unwrap(),
@@ -122,6 +132,10 @@ pub(crate) async fn apply_entry(
         Value::from_slice(&entry.raft_meta).expect("allocate raft_meta"),
     )?;
     stmt.bind_at(NonZero::new(3).unwrap(), Value::from_i64(epoch as i64))?;
+    stmt.bind_at(
+        NonZero::new(4).unwrap(),
+        Value::from_i64(last_rejected as i64),
+    )?;
     stmt.run_ignore_rows()?;
     drop(stmt);
     session.replay(&coro, DatabaseTapeOperation::Commit).await?;

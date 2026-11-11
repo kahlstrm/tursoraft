@@ -9,7 +9,7 @@ mod common;
 
 use common::*;
 use tempfile::TempDir;
-use tursoraft_changeset::{turso_core::Value, ChangeKind, ChangeSet, Statement};
+use tursoraft_changeset::{turso_core::Value, AheadDb, ChangeKind, ChangeSet, Error, Statement};
 use tursoraft_statemachine::{Outcome, StateMachine};
 
 const APPLIED: Outcome = Outcome::Applied;
@@ -585,5 +585,238 @@ fn turning_the_check_off_brings_back_plain_writes() {
     let y = p.capture(&["UPDATE t SET v = v + 1 WHERE id = 1"]);
     assert_eq!(p.apply(vec![x, y]), applied_ok(2));
     assert_eq!(p.rows("SELECT v FROM t"), ints(&[&[1]]), "a lost update");
+    p.assert_same();
+}
+
+/// Groups captured on an [`AheadDb`] see the groups before them although the
+/// node's own file does not have them yet, and apply in order with every
+/// check passing. Applied, they give the node's file what the ahead file
+/// holds.
+#[test]
+fn groups_captured_ahead_apply_in_order() {
+    let mut p = Pair::new(&[
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)",
+        "INSERT INTO t VALUES (1, 'a')",
+    ]);
+    let dir = TempDir::new().unwrap();
+    let ahead = AheadDb::open(dir.path().join("ahead.db")).unwrap();
+    assert_eq!(ahead.reset(&p.a.db).unwrap(), 1);
+    let group = |sqls: &[&[&str]]| -> Vec<Vec<u8>> {
+        let batch: Vec<Vec<Statement>> = sqls
+            .iter()
+            .map(|t| t.iter().map(|s| (*s).into()).collect())
+            .collect();
+        ahead
+            .capture_batch(&batch)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.unwrap().change_set)
+            .collect()
+    };
+    let g1 = group(&[&["UPDATE t SET v = v || 'b' WHERE id = 1"]]);
+    let g2 = group(&[
+        &["UPDATE t SET v = v || 'c' WHERE id = 1"],
+        &["ALTER TABLE t ADD COLUMN w"],
+    ]);
+    let g3 = group(&[&["INSERT INTO t SELECT 2, v, 'w' FROM t WHERE id = 1"]]);
+    for cs in g1.iter().chain(&g2).chain(&g3) {
+        let cs = ChangeSet::decode(cs).unwrap();
+        assert_eq!(cs.base_index, 1);
+        assert!(cs.reads_pending);
+    }
+    assert_eq!(p.rows("SELECT v FROM t"), values(vec![vec![txt("a")]]));
+    assert_eq!(p.apply(g1), applied_ok(1));
+    assert_eq!(p.apply(g2), applied_ok(2));
+    assert_eq!(p.apply(g3), applied_ok(1));
+    assert_eq!(
+        p.rows("SELECT * FROM t"),
+        values(vec![
+            vec![i(1), txt("abc"), Value::Null],
+            vec![i(2), txt("abc"), txt("w")]
+        ])
+    );
+    let without_position = |d: String| -> String {
+        d.lines()
+            // The ahead file keeps the commit record of its last batch.
+            .filter(|l| !l.starts_with("tursoraft_applied:") && !l.starts_with("turso_cdc:"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        without_position(dump(&ahead.connect().unwrap())),
+        without_position(dump(&p.a.db.connect().unwrap()))
+    );
+    p.assert_same();
+}
+
+/// A change set that read pending change sets is rejected once one of them
+/// is: here a change set from elsewhere comes first and makes the first
+/// group lose a write conflict, so the groups captured on top of it read a
+/// state that never existed. Every node decides alike from its file and the
+/// log: one that restarted, and one built from a snapshot, between the
+/// entries.
+#[test]
+fn a_rejection_rejects_every_later_change_set_that_read_pending_ones() {
+    let dir = TempDir::new().unwrap();
+    let mut a = node(&dir, "a.db");
+    let mut b = node(&dir, "b.db");
+    let mut c = node(&dir, "c.db");
+    let setup = capture(
+        &a,
+        &[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)",
+            "CREATE TABLE seen(v TEXT)",
+            "CREATE TABLE other(v TEXT)",
+            "INSERT INTO t VALUES (1, 'a')",
+        ],
+    );
+    apply_all(
+        &mut [&mut a, &mut b, &mut c],
+        &entry(1, vec![setup]),
+        &[APPLIED],
+    );
+    let ahead = AheadDb::open(dir.path().join("ahead.db")).unwrap();
+    assert_eq!(ahead.reset(&a.db).unwrap(), 1);
+    let on_ahead = |sql: &str| -> Vec<u8> {
+        ahead.capture_batch(&[vec![sql.into()]]).unwrap()[0]
+            .as_ref()
+            .unwrap()
+            .change_set
+            .clone()
+    };
+    // Captured on the node's own file at index 1, as a former leader would.
+    let foreign = capture(&a, &["UPDATE t SET v = 'foreign' WHERE id = 1"]);
+    let g1 = on_ahead("UPDATE t SET v = v || '+g1' WHERE id = 1");
+    let g2 = on_ahead("INSERT INTO seen SELECT v FROM t WHERE id = 1");
+    let g3 = on_ahead("INSERT INTO other VALUES ('g3')");
+
+    apply_all(
+        &mut [&mut a, &mut b, &mut c],
+        &entry(2, vec![foreign]),
+        &[APPLIED],
+    );
+    let e3 = entry(3, vec![g1]);
+    let o3 = a.sm.apply(&e3).unwrap();
+    assert!(reason(&o3[0]).starts_with("write conflict on t rowid 1"));
+    assert_eq!(b.sm.apply(&e3).unwrap(), o3);
+    // c restarts before entry 3, d is built from a snapshot after it.
+    drop(c);
+    let mut c = node(&dir, "c.db");
+    assert_eq!(c.sm.apply(&e3).unwrap(), o3);
+    let mut d = node(&dir, "d.db");
+    d.sm.install_snapshot(&a.sm.snapshot().unwrap()).unwrap();
+    let e4 = entry(4, vec![g2, g3]);
+    let mut outcomes = Vec::new();
+    for n in [&mut a, &mut b, &mut c, &mut d] {
+        outcomes.push(n.sm.apply(&e4).unwrap());
+    }
+    eprintln!("--- entry 4 on a, b, restarted c, snapshot d: {outcomes:?}");
+    assert!(outcomes.iter().all(|o| o == &outcomes[0]));
+    for o in &outcomes[0] {
+        assert!(
+            reason(o).starts_with("it read change sets that were not applied yet"),
+            "{o:?}"
+        );
+    }
+    assert_eq!(count(&a, "SELECT count(*) FROM seen"), 0);
+    assert_eq!(count(&a, "SELECT count(*) FROM other"), 0);
+
+    // After a reset the ahead file starts from the node's file again.
+    assert_eq!(ahead.reset(&a.db).unwrap(), 4);
+    let g5 = on_ahead("INSERT INTO seen SELECT v FROM t WHERE id = 1");
+    for n in [&mut a, &mut b, &mut c, &mut d] {
+        assert_eq!(n.sm.apply(&entry(5, vec![g5.clone()])).unwrap(), [APPLIED]);
+    }
+    assert_eq!(
+        values(query(&a.db.connect().unwrap(), "SELECT v FROM seen")),
+        values(vec![vec![txt("foreign")]])
+    );
+    for n in [&b, &c, &d] {
+        assert_same(&a, n);
+    }
+}
+
+/// Within one batch on the node's own file, a change set reads the earlier
+/// ones that changed something, so a rejection of the first rejects it.
+#[test]
+fn a_batch_member_that_read_a_rejected_one_is_rejected() {
+    let mut p = Pair::new(&[
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)",
+        "CREATE TABLE seen(v TEXT)",
+        "INSERT INTO t VALUES (1, 'a')",
+    ]);
+    let winner = p.capture(&["UPDATE t SET v = 'winner' WHERE id = 1"]);
+    let batch: Vec<Vec<Statement>> = vec![
+        vec!["SELECT 1".into()],
+        vec!["UPDATE t SET v = 'loser' WHERE id = 1".into()],
+        vec!["INSERT INTO seen SELECT v FROM t".into()],
+    ];
+    let batch: Vec<Vec<u8>> =
+        p.a.db
+            .capture_batch(&batch)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.unwrap().change_set)
+            .collect();
+    let pending: Vec<bool> = batch
+        .iter()
+        .map(|cs| ChangeSet::decode(cs).unwrap().reads_pending)
+        .collect();
+    assert_eq!(pending, [false, false, true]);
+    assert_eq!(p.apply(vec![winner]), [APPLIED]);
+    let outcomes = p.apply(batch);
+    assert_eq!(outcomes[0], APPLIED);
+    assert!(reason(&outcomes[1]).starts_with("write conflict"));
+    assert!(reason(&outcomes[2]).starts_with("it read change sets"));
+    assert_eq!(p.rows("SELECT count(*) FROM seen"), ints(&[&[0]]));
+    p.assert_same();
+}
+
+/// `INSERT OR ROLLBACK` on the ahead file undoes the earlier transactions
+/// of its batch; they report it instead of returning change sets that the
+/// ahead file no longer holds.
+#[test]
+fn a_failure_that_ends_the_transaction_on_the_ahead_file() {
+    let mut p = Pair::new(&[
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)",
+        "INSERT INTO t VALUES (1, 'a')",
+    ]);
+    let dir = TempDir::new().unwrap();
+    let ahead = AheadDb::open(dir.path().join("ahead.db")).unwrap();
+    ahead.reset(&p.a.db).unwrap();
+    let earlier = ahead
+        .capture_batch(&[vec!["INSERT INTO t VALUES (2, 'b')".into()]])
+        .unwrap();
+    let batch: Vec<Vec<Statement>> = vec![
+        vec!["INSERT INTO t VALUES (3, 'c')".into()],
+        vec!["INSERT OR ROLLBACK INTO t VALUES (4, 'a')".into()],
+        vec![
+            "SELECT count(*) FROM t".into(),
+            "INSERT INTO t VALUES (5, 'e')".into(),
+        ],
+    ];
+    let results = ahead.capture_batch(&batch).unwrap();
+    assert!(matches!(results[0], Err(Error::Undone { by: 1 })));
+    assert!(results[1]
+        .as_ref()
+        .unwrap_err()
+        .to_string()
+        .contains("UNIQUE"));
+    let last = results[2].as_ref().unwrap();
+    assert_eq!(
+        last.results[0].rows,
+        vec![vec![i(2)]],
+        "sees row 2, not row 3"
+    );
+    let proposals = vec![
+        earlier[0].as_ref().unwrap().change_set.clone(),
+        last.change_set.clone(),
+    ];
+    assert_eq!(p.apply(proposals), applied_ok(2));
+    assert_eq!(p.rows("SELECT id FROM t"), ints(&[&[1], &[2], &[5]]));
+    assert_eq!(
+        values(query(&ahead.connect().unwrap(), "SELECT id FROM t")),
+        p.rows("SELECT id FROM t")
+    );
     p.assert_same();
 }

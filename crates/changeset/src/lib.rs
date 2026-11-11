@@ -13,7 +13,11 @@
 //! - [`TursoStateMachine::apply`] applies an entry's change sets, each inside
 //!   its own savepoint, and writes the applied position in the same
 //!   transaction. A change set that another one, applied after its base,
-//!   conflicts with is rejected (snapshot isolation by rows).
+//!   conflicts with is rejected (snapshot isolation by rows). A change set
+//!   that read pending change sets is rejected when one of them was.
+//! - [`AheadDb`] is a second file for a leader that captures the next group
+//!   before the previous one is applied: groups run on it for real, so each
+//!   sees the ones before it.
 //! - [`NodeDb::connect`] gives connections for local reads, and
 //!   [`NodeDb::wait_for_applied`] waits until an entry has been applied.
 //!
@@ -45,8 +49,10 @@ use tursoraft_statemachine::{Applied, Entry, Outcome, Snapshot, StateMachine};
 pub use changeset::{ChangeKind, ChangeSet, RowChange};
 pub use turso_core;
 
-/// The table that holds the applied position and the schema epoch: the
-/// number of applied change sets that changed the schema. One row, `id = 0`.
+/// The table that holds the applied position, the schema epoch (the number of
+/// applied change sets that changed the schema) and `last_rejected` (the
+/// index of the last entry in which a change set was rejected, 0 if none).
+/// One row, `id = 0`.
 pub const APPLIED_TABLE: &str = "tursoraft_applied";
 
 /// How long capture waits for a writer outside this [`NodeDb`], such as a
@@ -71,6 +77,10 @@ pub enum Error {
     /// that lost a write conflict. `apply` turns it into a rejection.
     #[error("{0}")]
     Rejected(String),
+    /// [`AheadDb::capture_batch`]: a later transaction of the batch ended the
+    /// database transaction and undid this one. It had no effect.
+    #[error("undone by the failure of transaction {by} of the same batch")]
+    Undone { by: usize },
 }
 
 /// One SQL statement and its parameters, bound by position.
@@ -113,6 +123,9 @@ pub struct Captured {
     pub change_set: Vec<u8>,
 }
 
+/// One result per transaction of a batch.
+type BatchResults = Vec<Result<Captured, Error>>;
+
 /// One node's database file. Cheap to clone; clones share the file and the
 /// write lock.
 #[derive(Clone)]
@@ -148,7 +161,7 @@ impl NodeDb {
         conn.execute(format!(
             "CREATE TABLE IF NOT EXISTS {APPLIED_TABLE}(\
              id INTEGER PRIMARY KEY CHECK (id = 0), log_index INTEGER NOT NULL, raft_meta BLOB NOT NULL, \
-             schema_epoch INTEGER NOT NULL)"
+             schema_epoch INTEGER NOT NULL, last_rejected INTEGER NOT NULL)"
         ))?;
         // Turning CDC on creates `turso_cdc` and `turso_cdc_version` in a
         // transaction of its own. Doing it at open gives every node the same
@@ -199,6 +212,8 @@ impl NodeDb {
     /// at the end, so the database is unchanged. Returns one result per
     /// transaction. Proposed in order, the change sets apply with every
     /// conflict check passing, as long as no other change set comes between.
+    /// A change set that read an earlier one of the batch has
+    /// [`ChangeSet::reads_pending`] set, so it is rejected if that one is.
     ///
     /// A transaction that fails is undone alone and returns its error. A
     /// failure that ends the whole database transaction, as `INSERT OR
@@ -214,11 +229,11 @@ impl NodeDb {
     ) -> Result<Vec<Result<Captured, Error>>, Error> {
         let conn = self.shared.write.lock().unwrap();
         conn.execute("BEGIN IMMEDIATE")?;
-        let result = capture_in_transaction(&conn, transactions);
+        let result = capture_in_transaction(&conn, transactions, false);
         if !conn.get_auto_commit() {
             conn.execute("ROLLBACK")?;
         }
-        result
+        result.map(|(results, _)| results)
     }
 
     /// The state machine that applies committed entries to this file. Use one
@@ -264,6 +279,85 @@ impl NodeDb {
     }
 }
 
+/// A second database file for a leader that captures the next group of
+/// transactions before the previous groups are applied.
+///
+/// [`AheadDb::reset`] makes it a copy of the node's own file. Each
+/// [`AheadDb::capture_batch`] then runs its transactions for real and keeps
+/// their effects here, so the next group sees them although the node's own
+/// file does not have them yet. Every change set captured here records the
+/// copied position as its base and sets [`ChangeSet::reads_pending`]. As long
+/// as every change set captured since the reset is proposed in capture order,
+/// with no other change set between, and each one is applied, this file holds
+/// what the node's own file will hold. When one is rejected or lost, the
+/// change sets captured after it are rejected too, and the caller resets this
+/// file once its proposals are all decided.
+///
+/// Nothing reads this file but the capture, and a crash loses nothing that a
+/// reset does not rebuild, so its commits are not synced to disk.
+#[derive(Clone)]
+pub struct AheadDb {
+    db: NodeDb,
+}
+
+impl AheadDb {
+    /// Opens or creates the file at `path`. Call [`AheadDb::reset`] before
+    /// the first capture.
+    pub fn open(path: impl AsRef<Path>) -> Result<AheadDb, Error> {
+        let db = NodeDb::open(path)?;
+        db.shared
+            .write
+            .lock()
+            .unwrap()
+            .set_sync_mode(turso_core::SyncMode::Off);
+        Ok(AheadDb { db })
+    }
+
+    /// Replaces this file with a copy of `from`. Returns `from`'s applied
+    /// index, the base of every change set captured here until the next reset.
+    pub fn reset(&self, from: &NodeDb) -> Result<u64, Error> {
+        let snapshot = from.state_machine().snapshot()?;
+        self.db.state_machine().install_snapshot(&snapshot)?;
+        Ok(snapshot.applied.index)
+    }
+
+    /// Runs `transactions` as [`NodeDb::capture_batch`] does, on top of every
+    /// batch captured here since the last reset, and keeps their effects.
+    ///
+    /// A failure that ends the whole database transaction (`INSERT OR
+    /// ROLLBACK`) undoes the transactions of this batch before it. Unlike
+    /// [`NodeDb::capture_batch`], they then return [`Error::Undone`], so that
+    /// this file keeps the effect of every change set it returned.
+    pub fn capture_batch(
+        &self,
+        transactions: &[Vec<Statement>],
+    ) -> Result<Vec<Result<Captured, Error>>, Error> {
+        let conn = self.db.shared.write.lock().unwrap();
+        conn.execute("BEGIN IMMEDIATE")?;
+        let result = capture_in_transaction(&conn, transactions, true).and_then(|r| {
+            conn.execute("COMMIT")?;
+            Ok(r)
+        });
+        if result.is_err() && !conn.get_auto_commit() {
+            conn.execute("ROLLBACK")?;
+        }
+        let (mut results, ended) = result?;
+        if let Some(by) = ended {
+            for r in &mut results[..by] {
+                if r.is_ok() {
+                    *r = Err(Error::Undone { by });
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// A connection to this file, for checks. It must not write.
+    pub fn connect(&self) -> Result<Arc<Connection>, Error> {
+        self.db.connect()
+    }
+}
+
 fn check_allowed(index: usize, sql: &str) -> Result<(), Error> {
     use turso_parser::ast::{Cmd, Stmt};
     let not_allowed = |reason: String| Error::NotAllowed { index, reason };
@@ -294,13 +388,21 @@ fn check_allowed(index: usize, sql: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Runs `transactions` inside the open database transaction. With `ahead`,
+/// every change set reads pending ones (the file holds them); otherwise only
+/// those after an earlier change set of the batch that changed something.
+/// Also returns the last transaction whose failure ended the database
+/// transaction, which undid the transactions before it.
 fn capture_in_transaction(
     conn: &Arc<Connection>,
     transactions: &[Vec<Statement>],
-) -> Result<Vec<Result<Captured, Error>>, Error> {
+    ahead: bool,
+) -> Result<(BatchResults, Option<usize>), Error> {
     let base_index = read_applied(conn)?.map_or(0, |a| a.index);
     let base_epoch = read_schema_epoch(conn)?;
     let mut epoch = base_epoch;
+    let mut read_earlier = false;
+    let mut ended = None;
     let mut results = Vec::with_capacity(transactions.len());
     for statements in transactions {
         let allowed = statements
@@ -318,11 +420,13 @@ fn capture_in_transaction(
                 let change_set = ChangeSet {
                     base_index,
                     schema_epoch: epoch,
+                    reads_pending: ahead || read_earlier,
                     changes,
                 };
                 if change_set.changes_schema() {
                     epoch += 1;
                 }
+                read_earlier |= !change_set.changes.is_empty();
                 results.push(Ok(Captured {
                     results: statement_results,
                     change_set: change_set.encode(),
@@ -333,6 +437,8 @@ fn capture_in_transaction(
                     // The failure ended the database transaction.
                     conn.execute("BEGIN IMMEDIATE")?;
                     epoch = base_epoch;
+                    read_earlier = false;
+                    ended = Some(results.len());
                 } else {
                     conn.execute("ROLLBACK TO capture")?;
                     conn.execute("RELEASE capture")?;
@@ -341,7 +447,17 @@ fn capture_in_transaction(
             }
         }
     }
-    Ok(results)
+    if ahead {
+        // Keep the effects, but not CDC's records of them, and record the
+        // schema changes as apply would.
+        if epoch != base_epoch {
+            conn.execute(format!(
+                "UPDATE {APPLIED_TABLE} SET schema_epoch = {epoch} WHERE id = 0"
+            ))?;
+        }
+        conn.execute("DELETE FROM turso_cdc")?;
+    }
+    Ok((results, ended))
 }
 
 /// Runs one transaction's statements inside the open database transaction
@@ -643,12 +759,19 @@ fn read_applied(conn: &Arc<Connection>) -> Result<Option<Applied>, Error> {
 }
 
 fn read_schema_epoch(conn: &Arc<Connection>) -> Result<u64, Error> {
+    Ok(read_counters(conn)?.0)
+}
+
+/// The schema epoch and `last_rejected` of [`APPLIED_TABLE`].
+fn read_counters(conn: &Arc<Connection>) -> Result<(u64, u64), Error> {
     let rows = query(
         conn,
-        &format!("SELECT schema_epoch FROM {APPLIED_TABLE} WHERE id = 0"),
+        &format!("SELECT schema_epoch, last_rejected FROM {APPLIED_TABLE} WHERE id = 0"),
         &[],
     )?;
-    Ok(rows.first().map_or(0, |row| int(&row[0]) as u64))
+    Ok(rows
+        .first()
+        .map_or((0, 0), |row| (int(&row[0]) as u64, int(&row[1]) as u64)))
 }
 
 fn query(conn: &Arc<Connection>, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, Error> {

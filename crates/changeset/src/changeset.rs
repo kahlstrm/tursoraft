@@ -1,12 +1,13 @@
 //! The change-set format: one transaction's row changes as read from
 //! `turso_cdc`, encoded to bytes.
 //!
-//! Encoding, version 2 (all integers are LEB128 varints; `id` is zigzag):
+//! Encoding, version 3 (all integers are LEB128 varints; `id` is zigzag):
 //!
 //! ```text
-//! version: u8 = 2
+//! version: u8 = 3
 //! base_index: varint
 //! schema_epoch: varint
+//! flags: u8   bit 0 reads_pending
 //! table_count: varint, then per table: len: varint, UTF-8 bytes
 //! change_count: varint, then per change:
 //!     tag: u8   bits 0-1 kind (0 insert, 1 update, 2 delete),
@@ -18,20 +19,30 @@
 //!
 //! `before`, `after` and `updates` are kept exactly as CDC wrote them: SQLite
 //! binary records (see `turso_sync_engine::types::parse_bin_record`).
+//!
+//! Version 2 is version 3 without the flags byte; it decodes with
+//! `reads_pending` false.
 
 use crate::Error;
 
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 
 /// One transaction's changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeSet {
     /// The applied log index of the database when the transaction ran: its
-    /// reads saw exactly the entries up to this index.
+    /// reads saw the entries up to this index, and, if `reads_pending` is
+    /// set, the change sets after it up to this one.
     pub base_index: u64,
     /// The number of applied change sets that had changed the schema, as the
     /// transaction saw it. A change set applies only at the same schema epoch.
     pub schema_epoch: u64,
+    /// The transaction read the effects of change sets after `base_index`
+    /// that were not applied yet: earlier transactions of its batch, or groups
+    /// still on their way through the log. Such a change set is rejected if
+    /// any change set after `base_index` was rejected before it, since it read
+    /// a state that never existed.
+    pub reads_pending: bool,
     /// The row changes in the order the transaction made them. Schema changes
     /// are changes of the table `sqlite_schema`.
     pub changes: Vec<RowChange>,
@@ -93,6 +104,7 @@ impl ChangeSet {
         let mut out = vec![VERSION];
         put_varint(&mut out, self.base_index);
         put_varint(&mut out, self.schema_epoch);
+        out.push(u8::from(self.reads_pending));
         put_varint(&mut out, tables.len() as u64);
         for table in &tables {
             put_bytes(&mut out, table.as_bytes());
@@ -124,11 +136,19 @@ impl ChangeSet {
     pub fn decode(bytes: &[u8]) -> Result<ChangeSet, Error> {
         let mut r = Reader { bytes, pos: 0 };
         let version = r.byte()?;
-        if version != VERSION {
+        if version != 2 && version != VERSION {
             return Err(Error::Decode(format!("unknown version {version}")));
         }
         let base_index = r.varint()?;
         let schema_epoch = r.varint()?;
+        let reads_pending = match version {
+            2 => false,
+            _ => match r.byte()? {
+                0 => false,
+                1 => true,
+                flags => return Err(Error::Decode(format!("unknown flags {flags:#x}"))),
+            },
+        };
         let table_count = r.varint()?;
         let mut tables = Vec::new();
         for _ in 0..table_count {
@@ -180,6 +200,7 @@ impl ChangeSet {
         Ok(ChangeSet {
             base_index,
             schema_epoch,
+            reads_pending,
             changes,
         })
     }
@@ -247,6 +268,7 @@ mod tests {
         let set = ChangeSet {
             base_index: 300,
             schema_epoch: 7,
+            reads_pending: true,
             changes: vec![
                 RowChange {
                     kind: ChangeKind::Insert,
@@ -276,6 +298,14 @@ mod tests {
         };
         let bytes = set.encode();
         assert_eq!(ChangeSet::decode(&bytes).unwrap(), set);
+        // Version 2 has no flags byte (here at offset 4) and reads as not
+        // reading pending change sets.
+        let mut v2 = bytes.clone();
+        v2[0] = 2;
+        assert_eq!(v2.remove(4), 1);
+        let old = ChangeSet::decode(&v2).unwrap();
+        assert!(!old.reads_pending);
+        assert_eq!(old.changes, set.changes);
         assert!(ChangeSet::decode(&bytes[..bytes.len() - 1]).is_err());
         let mut longer = bytes.clone();
         longer.push(0);

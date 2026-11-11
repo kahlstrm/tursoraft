@@ -376,10 +376,18 @@ impl Drop for Shop {
     }
 }
 
+/// A free port below the kernel's range for outgoing connections
+/// (32768-60999 on Linux by default), as the other crates' tests pick them.
+/// A port that binding port 0 hands out comes from that range, so an
+/// outgoing connection made before the node binds it can take it.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    loop {
+        let n = std::process::id() * 37 + NEXT.fetch_add(1, Ordering::Relaxed);
+        let port = 20_000 + (n % 12_000) as u16;
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }

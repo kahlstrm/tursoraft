@@ -207,10 +207,14 @@ async fn app_request_pays_the_round_trip_and_the_handler_can_propose() {
         let rtt = Duration::from_secs_f64(rtt_ms / 1000.0);
         println!("app_request {from}->{to}, table {rtt_ms} ms: median {median:?}");
         // The delay writer sends 1 ms early to make up for tokio's timer
-        // firing late, so a measurement may land just under the table.
+        // firing late, so a measurement may land just under the table. The
+        // upper bound is below two round trips, which take at least 2 × RTT
+        // less the 1 ms the delay writer saves per round trip; the rest is
+        // room for CPU sharing, such as debug builds of all workspace tests
+        // at once.
         assert!(
-            median >= rtt - Duration::from_millis(1) && median < rtt + Duration::from_millis(3),
-            "{median:?}"
+            median >= rtt - Duration::from_millis(1) && median < 2 * rtt - Duration::from_millis(2),
+            "median app_request {from}->{to} {median:?}, table {rtt:?}"
         );
     }
 

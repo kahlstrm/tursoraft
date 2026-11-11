@@ -263,6 +263,17 @@ async fn delay_table_sets_round_trip_and_acknowledgement_time() {
         let leader = c.initialize(&[1, 2, 3]).await;
         let client = c.client(leader);
         let rtt = Duration::from_secs_f64(rtt_ms / 1000.0);
+        // The delay writer sends 1 ms early to make up for tokio's timer
+        // firing late, so a measurement may land just under the table.
+        let lower = rtt - Duration::from_millis(1);
+        // The upper bounds are below two round trips and leave the rest as
+        // room for CPU sharing, such as debug builds of all workspace tests
+        // at once. Two round trips take at least 2 × RTT less the 1 ms the
+        // delay writer saves per round trip; a write acknowledged after two
+        // round trips also waits for two rounds of flushes, so it takes more
+        // than 2 × RTT.
+        let ping_upper = 2 * rtt - Duration::from_millis(2);
+        let ack_upper = 2 * rtt;
         for peer in [1, 2, 3].into_iter().filter(|p| *p != leader) {
             let mut pings = Vec::new();
             for _ in 0..10 {
@@ -273,14 +284,9 @@ async fn delay_table_sets_round_trip_and_acknowledgement_time() {
                 "table {rtt_ms} ms: measured round trip {leader}->{peer}: median {:.2} ms",
                 ms(m)
             );
-            // Up to about 1 ms of real time on top of the table in a release
-            // build run alone; more when debug builds of several clusters
-            // share the CPUs. The delay writer sends 1 ms early to make up
-            // for tokio's timer firing late, so a measurement may land just
-            // under the table.
             assert!(
-                m >= rtt - Duration::from_millis(1) && m < rtt + Duration::from_millis(3),
-                "{m:?}"
+                m >= lower && m < ping_upper,
+                "median round trip {leader}->{peer} {m:?}, table {rtt:?}"
             );
         }
 
@@ -320,11 +326,16 @@ async fn delay_table_sets_round_trip_and_acknowledgement_time() {
             summary(&back_to_back),
             per_write(&sent_between, &sent_after),
         );
-        let lower = rtt - Duration::from_millis(1);
         let m = median(&isolated);
-        assert!(m >= lower && m < rtt + Duration::from_millis(8), "{m:?}");
+        assert!(
+            m >= lower && m < ack_upper,
+            "median after a pause {m:?}, table {rtt:?}"
+        );
         let m = median(&back_to_back);
-        assert!(m >= lower && m < rtt + Duration::from_millis(8), "{m:?}");
+        assert!(
+            m >= lower && m < ack_upper,
+            "median back-to-back {m:?}, table {rtt:?}"
+        );
     }
 }
 

@@ -1,9 +1,7 @@
 //! A cluster of nodes in this process, so that tests can subscribe to them.
 //!
 //! Each node runs on its own tokio runtime, and stopping a node drops its
-//! runtime, as a process exit would. [`Node::shutdown`] alone leaves the
-//! tasks that serve accepted connections running, and the leader keeps
-//! sending to them instead of to the restarted node.
+//! runtime, as a process exit would.
 
 #![allow(dead_code)]
 

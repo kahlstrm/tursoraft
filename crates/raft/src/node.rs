@@ -13,16 +13,17 @@ use openraft::error::{ChangeMembershipError, ClientWriteError, LinearizableReadE
 use openraft::storage::RaftStateMachine;
 use openraft::{BasicNode, ReadPolicy, SnapshotPolicy};
 use tokio::io::BufReader;
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tursoraft_statemachine::{Outcome, StateMachine};
 
 use crate::log_store::LogStore;
 use crate::network::{
-    encode, read_frame, spawn_writer, unexpected, Hello, InboundStreams, LeaderOp, Network,
-    NetworkFactory, Reply, Request, Response,
+    delayed_writer, encode, read_frame, unexpected, DelayedSender, Hello, InboundStreams, LeaderOp,
+    Network, NetworkFactory, Reply, Request, Response,
 };
 use crate::state_machine::StateMachineAdaptor;
 use crate::{Batching, Error, NodeConfig, NodeId, Proposed, Raft, Status};
@@ -617,26 +618,36 @@ async fn run_batcher(raft: Raft, cfg: Batching, mut rx: mpsc::UnboundedReceiver<
     }
 }
 
+/// Accepts connections and serves each in a task of its own. The tasks
+/// belong to this one: when [`Node::shutdown`] aborts it, every connection
+/// closes, so the other nodes connect again, to whichever node listens on
+/// the address then.
 async fn serve(listener: TcpListener, node: Node) {
+    let mut conns = JoinSet::new();
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let node = node.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = node.serve_conn(stream).await {
-                        tracing::debug!("connection closed: {e}");
-                    }
-                });
-            }
-            Err(e) => {
-                tracing::warn!("accept failed: {e}");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    let node = node.clone();
+                    conns.spawn(async move {
+                        if let Err(e) = node.serve_conn(stream).await {
+                            tracing::debug!("connection closed: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("accept failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            Some(_) = conns.join_next() => {}
         }
     }
 }
 
 impl Node {
+    /// Reads requests and writes their answers in the same task, so that
+    /// ending the task closes both directions of the connection.
     async fn serve_conn(self, stream: TcpStream) -> std::io::Result<()> {
         stream.set_nodelay(true)?;
         let (r, w) = stream.into_split();
@@ -645,13 +656,24 @@ impl Node {
         let delay = hello.from.map_or(Duration::ZERO, |from| {
             self.inner.config.delays.one_way(self.inner.id, from)
         });
-        let out = spawn_writer(w, delay, Default::default());
+        let (out, writer) = delayed_writer(w, delay);
+        tokio::select! {
+            res = self.serve_requests(r, &out) => res,
+            res = writer => res,
+        }
+    }
+
+    async fn serve_requests(
+        &self,
+        mut r: BufReader<OwnedReadHalf>,
+        out: &DelayedSender,
+    ) -> std::io::Result<()> {
         let mut streams = InboundStreams::default();
         loop {
             let (id, req): (u64, Request) = read_frame(&mut r).await?;
             let req = match req {
                 Request::StreamAppend { stream, req } => {
-                    streams.push(&self.inner.raft, &out, stream, id, req);
+                    streams.push(&self.inner.raft, out, stream, id, req);
                     continue;
                 }
                 Request::StreamEnd { stream } => {

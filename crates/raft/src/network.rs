@@ -169,14 +169,27 @@ pub(crate) fn spawn_writer(
     delay: Duration,
     closed: Arc<AtomicBool>,
 ) -> DelayedSender {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (out, writer) = delayed_writer(w, delay);
     tokio::spawn(async move {
-        if let Err(e) = write_frames(BufWriter::new(w), rx).await {
+        if let Err(e) = writer.await {
             tracing::debug!("connection writer stopped: {e}");
         }
         closed.store(true, Ordering::SeqCst);
     });
-    DelayedSender { tx, delay }
+    out
+}
+
+/// A sender of frames and the future that writes them to `w`, each `delay`
+/// after it was sent. The future ends when every sender is gone.
+pub(crate) fn delayed_writer(
+    w: OwnedWriteHalf,
+    delay: Duration,
+) -> (DelayedSender, impl Future<Output = io::Result<()>>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (
+        DelayedSender { tx, delay },
+        write_frames(BufWriter::new(w), rx),
+    )
 }
 
 async fn write_frames(

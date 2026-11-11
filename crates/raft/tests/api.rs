@@ -13,7 +13,8 @@ use tursoraft_raft::{
 };
 
 struct InProcess {
-    _dir: TempDir,
+    dir: TempDir,
+    config: ClusterConfig,
     nodes: BTreeMap<NodeId, Node>,
     sms: BTreeMap<NodeId, CountingStateMachine>,
 }
@@ -38,16 +39,7 @@ async fn start(ids: &[NodeId], change: impl FnOnce(&mut ClusterConfig)) -> (InPr
     let mut nodes = BTreeMap::new();
     let mut sms = BTreeMap::new();
     for id in ids {
-        let sm = CountingStateMachine::new(CountingOptions {
-            record: true,
-            reject_prefix: Some(b"reject".to_vec()),
-            ..Default::default()
-        })
-        .unwrap();
-        let node_dir = dir.path().join(format!("node-{id}"));
-        let node = Node::start(config.node_config(*id, node_dir).unwrap(), sm.clone())
-            .await
-            .unwrap();
+        let (node, sm) = start_node(&dir, &config, *id).await;
         nodes.insert(*id, node);
         sms.insert(*id, sm);
     }
@@ -68,12 +60,32 @@ async fn start(ids: &[NodeId], change: impl FnOnce(&mut ClusterConfig)) -> (InPr
     };
     (
         InProcess {
-            _dir: dir,
+            dir,
+            config,
             nodes,
             sms,
         },
         leader,
     )
+}
+
+/// Starts node `id` in its directory under `dir`, with a new state machine.
+async fn start_node(
+    dir: &TempDir,
+    config: &ClusterConfig,
+    id: NodeId,
+) -> (Node, CountingStateMachine) {
+    let sm = CountingStateMachine::new(CountingOptions {
+        record: true,
+        reject_prefix: Some(b"reject".to_vec()),
+        ..Default::default()
+    })
+    .unwrap();
+    let node_dir = dir.path().join(format!("node-{id}"));
+    let node = Node::start(config.node_config(id, node_dir).unwrap(), sm.clone())
+        .await
+        .unwrap();
+    (node, sm)
 }
 
 /// Groups proposed concurrently, half of them through followers, each land in
@@ -251,6 +263,39 @@ async fn app_request_pays_the_round_trip_and_the_handler_can_propose() {
         .app_request(leader, b"x".to_vec(), Duration::from_secs(5))
         .await;
     assert_eq!(err, Err(Error::App("nope".into())));
+    for n in c.nodes.values() {
+        n.shutdown().await;
+    }
+}
+
+/// A node shut down and started again in the same process, on the same
+/// address and directory, gets the entries proposed after it came back. The
+/// old node's runtime stays alive, as in an application that restarts its
+/// node without exiting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_restarted_in_the_same_process_gets_new_entries() {
+    let (mut c, leader) = start(&[1, 2, 3], |_| {}).await;
+    let follower = *c.nodes.keys().find(|id| **id != leader).unwrap();
+    c.nodes[&leader].propose(b"before".to_vec()).await.unwrap();
+    let old = c.nodes.remove(&follower).unwrap();
+    old.shutdown().await;
+    drop(old);
+    c.nodes[&leader]
+        .propose(b"while down".to_vec())
+        .await
+        .unwrap();
+    let (node, sm) = start_node(&c.dir, &c.config, follower).await;
+    let p = c.nodes[&leader].propose(b"after".to_vec()).await.unwrap();
+    let applied = node.wait_applied(p.index, Duration::from_secs(5)).await;
+    assert!(
+        applied.is_ok(),
+        "node {follower} did not apply index {}: {applied:?}; its status: {:?}",
+        p.index,
+        node.status()
+    );
+    let record = sm.stats().record.unwrap();
+    assert!(record.contains(&(p.index, b"after".to_vec())));
+    c.nodes.insert(follower, node);
     for n in c.nodes.values() {
         n.shutdown().await;
     }

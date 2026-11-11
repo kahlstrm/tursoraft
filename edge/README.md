@@ -39,7 +39,7 @@ tursoraft node ── Node::subscribe ── relay ══ WebSocket ══> Work
 | `src/protocol.ts` | Messages and the wire form of values |
 | `wrangler.toml` | Deployment config (not deployed yet) |
 | `test/edge.mjs` | Starts the Worker under Miniflare |
-| `test/serve.mjs` | The same, for the Rust tests in `crates/relay/tests` |
+| `test/serve.mjs` | The same, for the Rust tests and `deploy/local.sh --edge` |
 | `test/follower.test.mjs` | Tests of the follower with hand-written relay messages |
 | `test/bench.mjs` | How fast one follower applies change sets |
 

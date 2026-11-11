@@ -8,11 +8,14 @@
 #   deploy/local.sh [--reserve counter|units|leader] [--duration S]
 #                   [--flash-at S] [--shoppers N] [--flash-shoppers N]
 #                   [--flash-stock N] [--break ack-rejected|oversell]
-#                   [--dir DIR] [--keep]
+#                   [--dir DIR] [--keep] [--edge NAME]
 #
 # Results and node logs go to DIR (default: a new directory under /tmp).
 # --break starts every instance with that deliberate defect, to show that
 # the checker catches it. --keep leaves the cluster running afterwards.
+# --edge NAME also runs the edge Worker (edge/) under Miniflare and has the
+# instance NAME relay to the Worker's follower NAME, so that the Worker's
+# product pages can be read next to the store's. Needs `npm ci` in edge/.
 # Exits with the checker's status.
 set -euo pipefail
 
@@ -31,6 +34,7 @@ stock=1000
 break_flag=()
 dir=
 keep=
+edge=
 while [ $# -gt 0 ]; do
   case $1 in
     --reserve) reserve=$2; shift 2 ;;
@@ -42,6 +46,7 @@ while [ $# -gt 0 ]; do
     --break) break_flag=(--break "$2"); shift 2 ;;
     --dir) dir=$2; shift 2 ;;
     --keep) keep=1; shift ;;
+    --edge) edge=$2; shift 2 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -79,12 +84,29 @@ stop() {
 }
 if [ -z "$keep" ]; then trap stop EXIT; fi
 
+if [ -n "$edge" ]; then
+  jq -e --arg n "$edge" '.nodes[] | select(.name == $n)' "$regions" > /dev/null \
+    || { echo "--edge: no node $edge in $regions" >&2; exit 2; }
+  # The relay reads the secret from this file; the Worker from its environment.
+  (umask 077; head -c 32 /dev/urandom | base64 | tr -d '+/=\n' > "$dir/relay-secret")
+  RELAY_SECRET=$(cat "$dir/relay-secret") node "$root/edge/test/serve.mjs" --until-signal \
+    > "$dir/edge.out" 2> "$dir/edge.log" &
+  pids+=($!)
+  for _ in $(seq 300); do grep -q url "$dir/edge.out" 2>/dev/null && break; sleep 0.1; done
+  worker=$(jq -er .url "$dir/edge.out" 2>/dev/null) \
+    || { echo "the edge Worker did not start:"; cat "$dir/edge.log"; exit 1; }
+fi
+
 for id in "${ids[@]}"; do
   n=$(name "$id")
   rm -rf "$dir/node-$id"
+  relay=()
+  if [ "$n" = "$edge" ]; then
+    relay=(--relay "${worker/http:/ws:}/relay?follower=$n" --relay-secret-file "$dir/relay-secret")
+  fi
   "$bin" serve --config "$dir/cluster.json" --id "$id" --dir "$dir/node-$id" \
     --http "127.0.0.1:$((http_base + id))" --admin "127.0.0.1:$((admin_base + id))" \
-    --name "$n" "${break_flag[@]}" > "$dir/node-$id.out" 2> "$dir/node-$id.log" &
+    --name "$n" "${break_flag[@]}" "${relay[@]}" > "$dir/node-$id.out" 2> "$dir/node-$id.log" &
   pids+=($!)
 done
 for id in "${ids[@]}"; do
@@ -122,4 +144,8 @@ status=0
 for id in "${ids[@]}"; do
   echo "node $id: shop http://127.0.0.1:$((http_base + id))  admin http://127.0.0.1:$((admin_base + id))"
 done
+if [ -n "$edge" ]; then
+  echo "edge: $worker/products/0?follower=$edge (the follower that node $edge relays to;"
+  echo "  add &at=<log index> to wait for a write, as the store's answers give it)"
+fi
 exit $status

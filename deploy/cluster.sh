@@ -13,6 +13,10 @@
 #                                        instance at once, collect the results, run the checker
 #   deploy/cluster.sh status             every instance's view of the cluster
 #   deploy/cluster.sh reset              stop every instance and delete its data, to start over
+#   deploy/cluster.sh edge --worker URL --on NAME=FOLLOWER [--on NAME=FOLLOWER ...]
+#                                        from the next install, the instance on machine NAME
+#                                        relays its changes to follower FOLLOWER of the edge
+#                                        Worker at URL (edge/); --off stops every relay
 #
 # The nodes talk over WireGuard (10.77.0.ID), because tursoraft's traffic has
 # no encryption and no authentication. The shop's HTTP port is public; the
@@ -37,6 +41,15 @@ admin_port=$(jq -r .admin_port "$regions")
 
 mapfile -t lines < "$hosts"
 field() { awk -v n="$2" '{print $n}' <<< "$1"; }
+
+# The edge tier, if `edge` turned it on: state/edge holds the Worker's URL
+# and which machine relays to which follower, state/relay-secret the
+# secret the relays and the Worker share.
+edge=$state/edge
+secret=$state/relay-secret
+worker() { awk '$1 == "worker" {print $2}' "$edge"; }
+# The follower the instance on machine $1 relays to, or nothing.
+follower_of() { [ ! -f "$edge" ] || awk -v n="$1" '$1 == "relay" && $2 == n {print $3}' "$edge"; }
 first_voter=$(awk '$3 == "voter" {print; exit}' "$hosts")
 
 ssh_opts=(-i "$state/id_ed25519" -o StrictHostKeyChecking=accept-new
@@ -101,6 +114,14 @@ render() {
         echo "PersistentKeepalive = 25"
       done
     } > "$dir/wg0.conf"
+    # A relaying instance gets the secret as a systemd credential: the unit
+    # names only the file, and the service user reads its own copy of it.
+    local follower relay_args="" credential=""
+    follower=$(follower_of "$name")
+    if [ -n "$follower" ]; then
+      relay_args=" --relay $(worker | sed 's|^http|ws|')/relay?follower=$follower --relay-secret-file \${CREDENTIALS_DIRECTORY}/relay-secret"
+      credential=$'\n'"LoadCredential=relay-secret:/etc/tursoraft-shop/relay-secret"
+    fi
     cat > "$dir/tursoraft-shop.service" <<EOF
 [Unit]
 Description=tursoraft shop, node $id ($name)
@@ -108,7 +129,7 @@ Requires=wg-quick@wg0.service
 After=wg-quick@wg0.service network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/tursoraft-shop serve --config /etc/tursoraft-shop/cluster.json --id $id --dir /var/lib/tursoraft-shop --http 0.0.0.0:$http_port --admin $net.$id:$admin_port --name $name
+ExecStart=/usr/local/bin/tursoraft-shop serve --config /etc/tursoraft-shop/cluster.json --id $id --dir /var/lib/tursoraft-shop --http 0.0.0.0:$http_port --admin $net.$id:$admin_port --name $name$relay_args$credential
 DynamicUser=yes
 StateDirectory=tursoraft-shop
 Environment=RUST_LOG=warn
@@ -129,6 +150,13 @@ upload() {
   copy "$dir/wg0.conf" "root@$ip:/etc/wireguard/wg0.conf"
   copy "$dir/cluster.json" "root@$ip:/etc/tursoraft-shop/cluster.json"
   copy "$dir/tursoraft-shop.service" "root@$ip:/etc/systemd/system/tursoraft-shop.service"
+  # Over SSH's stdin, so the secret is never in a command line, and
+  # readable by root only from the start.
+  if [ -n "$(follower_of "$name")" ]; then
+    on "$ip" 'umask 077; cat > /etc/tursoraft-shop/relay-secret' < "$secret"
+  else
+    on "$ip" 'rm -f /etc/tursoraft-shop/relay-secret'
+  fi
   on "$ip" 'set -e
     chmod 600 /etc/wireguard/wg0.conf
     systemctl daemon-reload
@@ -223,6 +251,65 @@ status() {
     curl -sS --max-time 5 "http://$(field "$line" 4):$http_port/api/status" || printf 'no answer'
     echo
   done
+  [ -f "$edge" ] || return 0
+  for line in "${lines[@]}"; do
+    local f; f=$(follower_of "$(field "$line" 2)")
+    [ -n "$f" ] && echo "$(field "$line" 2) relays to $(worker)/?follower=$f"
+  done
+  return 0
+}
+
+edge_cmd() {
+  local url="" relays=() off=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --worker) url=${2%/}; shift 2 ;;
+      --on) relays+=("$2"); shift 2 ;;
+      --off) off=1; shift ;;
+      *) die "unknown argument $1" ;;
+    esac
+  done
+  if [ -n "$off" ]; then
+    rm -f "$edge"
+    echo "no instance relays from the next install"
+    return
+  fi
+  [[ $url =~ ^https?://[A-Za-z0-9.:-]+$ ]] || die "--worker is the Worker's base URL, such as https://tursoraft-edge.NAME.workers.dev"
+  [ ${#relays[@]} -gt 0 ] || die "name at least one --on MACHINE=FOLLOWER"
+  local out="worker $url" seen=" " followers=" " relay name follower
+  for relay in "${relays[@]}"; do
+    name=${relay%%=*}; follower=${relay#*=}
+    awk -v n="$name" '$2 == n {f=1} END {exit !f}' "$hosts" || die "no machine $name in $hosts"
+    [[ $follower =~ ^[A-Za-z0-9_-]+$ ]] || die "a follower name is letters, digits, '-' or '_', not '$follower'"
+    # Two relays to one follower would take it over from each other.
+    [[ $seen == *" $name "* ]] && die "machine $name is named twice"
+    [[ $followers == *" $follower "* ]] && die "follower $follower has two relays"
+    seen="$seen$name "; followers="$followers$follower "
+    out="$out"$'\n'"relay $name $follower"
+  done
+  echo "$out" > "$edge"
+  if [ ! -s "$secret" ]; then
+    (umask 077; head -c 32 /dev/urandom | base64 | tr -d '+/=\n' > "$secret")
+    echo "made a new secret in $secret"
+  fi
+  echo "relays from the next install:"
+  sed -n 's/^relay \(.*\) \(.*\)/  \1 -> \2/p' "$edge"
+  echo "the Worker needs the same secret: (cd edge && npx wrangler secret put RELAY_SECRET < $secret)"
+  echo "next: deploy/cluster.sh install"
+}
+
+# A follower refuses a copy older than what it has, and a wiped cluster
+# starts again at log index 1: make each follower forget its copy.
+forget_followers() {
+  [ -f "$edge" ] || return 0
+  local header f
+  header=$(mktemp "$state/header.XXXXXX")
+  printf 'Authorization: Bearer %s\n' "$(cat "$secret")" > "$header"
+  while read -r f; do
+    curl -sSf --max-time 30 -X POST -H @"$header" "$(worker)/admin/forget?follower=$f" > /dev/null \
+      || echo "follower $f did not forget its copy: the relay will be refused until it does" >&2
+  done < <(awk '$1 == "relay" {print $3}' "$edge")
+  rm -f "$header"
 }
 
 # Every node is stopped and wiped before any starts again: a node that
@@ -245,6 +332,7 @@ case $cmd in
   init) init "$@" ;;
   load) load "$@" ;;
   status) status ;;
-  reset) each wipe_one; each start_one; echo "every instance is empty; next: init" ;;
-  *) die "usage: $0 install [BINARY] | rtt | init [...] | load [...] | status | reset" ;;
+  reset) each wipe_one; forget_followers; each start_one; echo "every instance is empty; next: init" ;;
+  edge) edge_cmd "$@" ;;
+  *) die "usage: $0 install [BINARY] | rtt | init [...] | load [...] | status | reset | edge [...]" ;;
 esac

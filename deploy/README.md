@@ -21,6 +21,12 @@ exits with status 1 if the checker found a violation. `--break oversell` or
 `--break ack-rejected` starts every instance with a deliberate defect, to see
 the checker fail.
 
+`--edge sin` also runs the edge Worker of `edge/` under Miniflare and has the
+instance `sin` relay its node's changes to the Worker's follower `sin`. With
+`--keep`, the Worker's product page (printed at the end) can be read next to
+the store's; add `&at=<log index>` to wait for a write. Needs `npm ci` in
+`edge/`.
+
 ## On Hetzner Cloud
 
 ```bash
@@ -32,6 +38,9 @@ deploy/cluster.sh rtt                # the measured round trips between the mach
 deploy/cluster.sh init --reserve counter
 deploy/cluster.sh load --duration 300 --shoppers 16 --flash-at 60 --flash-shoppers 8
 deploy/cluster.sh reset              # empty every instance; then init with another design
+deploy/cluster.sh edge --worker https://tursoraft-edge.NAME.workers.dev --on sin=apac
+                                     # optional, before install: instance sin relays to the
+                                     # Worker's follower apac (see "The edge tier" below)
 deploy/hetzner.sh list               # what runs, and what it has cost so far
 deploy/hetzner.sh down               # delete everything with the label tursoraft-shop=1
 ```
@@ -61,6 +70,34 @@ shop's HTTP port. The admin API (forming the cluster, setting up the store,
 exporting all data) listens on the WireGuard address only. The shop's HTTP
 API has no authentication either: anyone who finds the address can fill carts
 and place orders.
+
+## The edge tier
+
+`edge/` holds a Worker and reads-only follower Durable Objects that render
+the store's product pages from a copy of its tables. An instance feeds a
+follower when it runs with `--relay URL --relay-secret-file FILE`. Not
+deployed yet: there is no Cloudflare account.
+
+`cluster.sh edge --worker URL --on MACHINE=FOLLOWER ...` records, in
+`state/edge`, which instances relay to which follower, and makes a random
+secret in `state/relay-secret` (mode 600) the first time. The next
+`install` then:
+
+- writes `--relay wss://HOST/relay?follower=FOLLOWER --relay-secret-file
+  ${CREDENTIALS_DIRECTORY}/relay-secret` into the unit of each chosen
+  instance, with `LoadCredential=relay-secret:/etc/tursoraft-shop/relay-secret`.
+  The unit and the process list name the file, never the secret.
+- copies the secret to `/etc/tursoraft-shop/relay-secret` (mode 600, root)
+  over SSH's stdin, and deletes that file on machines that do not relay.
+
+The Worker needs the same secret: `npx wrangler secret put RELAY_SECRET <
+deploy/state/relay-secret` in `edge/`. `cluster.sh edge --off` and an
+`install` stop every relay. `reset` also tells each follower to forget its
+copy (`POST /admin/forget`), because a follower refuses a copy older than
+the one it has, and a wiped cluster starts again at log index 1. Give each
+follower one relay only: a second relay takes the follower over from the
+first. A follower is placed where it is first used; nothing sets a
+`locationHint` yet.
 
 ## Raft timeouts on a real network
 

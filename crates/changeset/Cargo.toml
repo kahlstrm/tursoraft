@@ -1,0 +1,21 @@
+[package]
+name = "tursoraft-changeset"
+description = "Capture a Turso write transaction as a change set and apply it to another database"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tursoraft-statemachine.workspace = true
+turso_core = { workspace = true, features = ["conn_raw_api"] }
+turso_sqlite.workspace = true
+turso_sync_engine.workspace = true
+# Recognizes statements that capture must refuse, such as COMMIT.
+turso_parser = { path = "../../../sqlite/parser" }
+# turso_sync_engine's async API is driven by genawaiter coroutines (see tests/replay.rs).
+genawaiter = { version = "0.99.1", default-features = false }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

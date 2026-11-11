@@ -1,0 +1,29 @@
+[workspace]
+# Resolver 3 picks dependency versions that support `rust-version` below.
+# With resolver 2, roaring and uuid resolve to versions that need rustc 1.89+.
+resolver = "3"
+members = ["crates/statemachine", "crates/changeset", "crates/raft", "crates/node"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+tursoraft-statemachine = { path = "crates/statemachine" }
+tursoraft-changeset = { path = "crates/changeset" }
+tursoraft-raft = { path = "crates/raft" }
+
+# Turso Database from the enclosing checkout (0c9fe0dd94c14a4f00106bffa9c9433d5965fd3a,
+# version 0.9.0-pre.5).
+turso_core = { path = "../core" }
+turso_sqlite = { path = "../sqlite/frontend" }
+turso_sync_engine = { path = "../sync/engine" }
+
+# 0.10.0 is the stable line since 10 Nov 2026; it adds pipelined replication
+# and leadership transfer.
+openraft = { version = "=0.10.0", features = ["serde", "type-alias"] }
+
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"

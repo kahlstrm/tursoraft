@@ -1,0 +1,675 @@
+//! Change sets on Turso: capture one transaction's row changes, and apply
+//! committed change sets to a database file as the replicated state machine.
+//!
+//! A [`NodeDb`] owns one database file in WAL mode. Its file changes only
+//! through [`TursoStateMachine::apply`] and
+//! [`TursoStateMachine::install_snapshot`]:
+//!
+//! - [`NodeDb::capture`] runs statements as one transaction, reads the
+//!   transaction's change records from `turso_cdc`, and rolls the transaction
+//!   back. The encoded [`ChangeSet`] is one Raft proposal.
+//! - [`NodeDb::capture_batch`] does the same for several transactions in a
+//!   row, each seeing the ones before it.
+//! - [`TursoStateMachine::apply`] applies an entry's change sets, each inside
+//!   its own savepoint, and writes the applied position in the same
+//!   transaction. A change set that another one, applied after its base,
+//!   conflicts with is rejected (snapshot isolation by rows).
+//! - [`NodeDb::connect`] gives connections for local reads, and
+//!   [`NodeDb::wait_for_applied`] waits until an entry has been applied.
+//!
+//! Capture and apply take one write lock per [`NodeDb`], so they run one at a
+//! time; neither sees Turso's "database is busy" from the other.
+//!
+//! Foreign keys are enforced both when a transaction is captured and when it
+//! is applied.
+
+mod apply;
+mod changeset;
+
+use std::{
+    future::Future,
+    num::NonZero,
+    path::Path,
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
+};
+
+use turso_core::{ConnectOpts, Connection, Database, LimboError, Numeric, OpenOptions, Value, IO};
+use turso_sqlite::SqliteDialect;
+use turso_sync_engine::{
+    database_tape::{DatabaseTape, DatabaseTapeOpts},
+    types::Coro,
+};
+use tursoraft_statemachine::{Applied, Entry, Outcome, Snapshot, StateMachine};
+
+pub use changeset::{ChangeKind, ChangeSet, RowChange};
+pub use turso_core;
+
+/// The table that holds the applied position and the schema epoch: the
+/// number of applied change sets that changed the schema. One row, `id = 0`.
+pub const APPLIED_TABLE: &str = "tursoraft_applied";
+
+/// How long capture waits for a writer outside this [`NodeDb`], such as a
+/// read connection that wrote.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("database error: {0}")]
+    Database(#[from] LimboError),
+    #[error("replay error: {0}")]
+    Replay(#[from] turso_sync_engine::errors::Error),
+    #[error("statement {index} failed: {source}")]
+    Statement { index: usize, source: LimboError },
+    #[error("statement {index} is not allowed in a captured transaction: {reason}")]
+    NotAllowed { index: usize, reason: String },
+    #[error("invalid change set: {0}")]
+    Decode(String),
+    #[error("invalid snapshot: {0}")]
+    Snapshot(String),
+    /// A proposal that cannot be applied to the current state, such as one
+    /// that lost a write conflict. `apply` turns it into a rejection.
+    #[error("{0}")]
+    Rejected(String),
+}
+
+/// One SQL statement and its parameters, bound by position.
+#[derive(Debug, Clone)]
+pub struct Statement {
+    pub sql: String,
+    pub params: Vec<Value>,
+}
+
+impl Statement {
+    pub fn new(sql: impl Into<String>, params: Vec<Value>) -> Self {
+        Self {
+            sql: sql.into(),
+            params,
+        }
+    }
+}
+
+impl From<&str> for Statement {
+    fn from(sql: &str) -> Self {
+        Self::new(sql, Vec::new())
+    }
+}
+
+/// What one statement returned inside the captured transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatementResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Value>>,
+    /// Rows the statement inserted, updated or deleted (`changes()`).
+    pub rows_changed: u64,
+}
+
+/// The result of [`NodeDb::capture`].
+#[derive(Debug, Clone)]
+pub struct Captured {
+    pub results: Vec<StatementResult>,
+    /// The encoded [`ChangeSet`]: one proposal. A transaction that wrote
+    /// nothing gives a change set without changes.
+    pub change_set: Vec<u8>,
+}
+
+/// One node's database file. Cheap to clone; clones share the file and the
+/// write lock.
+#[derive(Clone)]
+pub struct NodeDb {
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    io: Arc<dyn IO>,
+    db: Arc<Database>,
+    /// Held by capture, apply, snapshot and install_snapshot. Holds the
+    /// connection that captures, with CDC on.
+    write: Mutex<Arc<Connection>>,
+    /// Replay connections have CDC off, so applying records nothing.
+    tape: Arc<DatabaseTape>,
+    applied_index: Mutex<u64>,
+    applied_changed: Condvar,
+}
+
+impl NodeDb {
+    /// Opens or creates the database file at `path`.
+    pub fn open(path: impl AsRef<Path>) -> Result<NodeDb, Error> {
+        let path = path.as_ref().to_str().expect("database path is UTF-8");
+        let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new()?);
+        let db = Database::open(io.clone(), path, OpenOptions::new(Arc::new(SqliteDialect)))?;
+        let conn = db.connect(ConnectOpts::new())?;
+        let mode = query(&conn, "PRAGMA journal_mode", &[])?;
+        assert_eq!(
+            mode[0][0],
+            Value::build_text("wal"),
+            "change sets are applied to databases in WAL mode only"
+        );
+        conn.execute(format!(
+            "CREATE TABLE IF NOT EXISTS {APPLIED_TABLE}(\
+             id INTEGER PRIMARY KEY CHECK (id = 0), log_index INTEGER NOT NULL, raft_meta BLOB NOT NULL, \
+             schema_epoch INTEGER NOT NULL)"
+        ))?;
+        // Turning CDC on creates `turso_cdc` and `turso_cdc_version` in a
+        // transaction of its own. Doing it at open gives every node the same
+        // tables; captured rows are always rolled back, so they stay empty.
+        let capture = db.connect(ConnectOpts::new())?;
+        capture.execute("PRAGMA capture_data_changes_conn('full')")?;
+        capture.set_busy_timeout(BUSY_TIMEOUT);
+        capture.set_foreign_keys_enabled(true);
+        let tape = Arc::new(DatabaseTape::new_with_opts(
+            db.clone(),
+            DatabaseTapeOpts {
+                cdc_table: None,
+                cdc_mode: Some("off".to_string()),
+                disable_auto_checkpoint: false,
+            },
+        ));
+        let applied_index = read_applied(&conn)?.map_or(0, |a| a.index);
+        Ok(NodeDb {
+            shared: Arc::new(Shared {
+                io,
+                db,
+                write: Mutex::new(capture),
+                tape,
+                applied_index: Mutex::new(applied_index),
+                applied_changed: Condvar::new(),
+            }),
+        })
+    }
+
+    /// Runs `statements` as one transaction, returns their results and the
+    /// encoded change set, and rolls the transaction back, so the database is
+    /// unchanged. The change set records the applied index and the schema
+    /// epoch the transaction read. CDC records nothing for CREATE and DROP of
+    /// triggers and views; capture adds their `sqlite_schema` changes itself.
+    ///
+    /// A failing statement rolls the transaction back and returns
+    /// [`Error::Statement`]. Statements that control the transaction (BEGIN,
+    /// COMMIT, ROLLBACK, SAVEPOINT, RELEASE) or contain more than one statement
+    /// are refused before anything runs.
+    pub fn capture(&self, statements: &[Statement]) -> Result<Captured, Error> {
+        self.capture_batch(&[statements.to_vec()])?
+            .pop()
+            .expect("one result per transaction")
+    }
+
+    /// Runs `transactions` one after another as [`NodeDb::capture`] does, but
+    /// each sees the writes of the ones before it, and rolls all of them back
+    /// at the end, so the database is unchanged. Returns one result per
+    /// transaction. Proposed in order, the change sets apply with every
+    /// conflict check passing, as long as no other change set comes between.
+    ///
+    /// A transaction that fails is undone alone and returns its error. A
+    /// failure that ends the whole database transaction, as `INSERT OR
+    /// ROLLBACK` and `RAISE(ROLLBACK)` do, also undoes the transactions before
+    /// it: they keep their results and change sets, but the transactions after
+    /// it run on the state at the start of the batch.
+    ///
+    /// The outer error is a failure of the batch as a whole, such as a busy
+    /// database.
+    pub fn capture_batch(
+        &self,
+        transactions: &[Vec<Statement>],
+    ) -> Result<Vec<Result<Captured, Error>>, Error> {
+        let conn = self.shared.write.lock().unwrap();
+        conn.execute("BEGIN IMMEDIATE")?;
+        let result = capture_in_transaction(&conn, transactions);
+        if !conn.get_auto_commit() {
+            conn.execute("ROLLBACK")?;
+        }
+        result
+    }
+
+    /// The state machine that applies committed entries to this file. Use one
+    /// per [`NodeDb`].
+    pub fn state_machine(&self) -> TursoStateMachine {
+        TursoStateMachine {
+            shared: self.shared.clone(),
+            check: true,
+        }
+    }
+
+    /// A new connection for local reads. It must not write: a write would
+    /// change this node's file outside the log. Each read transaction sees the
+    /// entries applied when it started. After a snapshot is installed, the
+    /// connection stays usable; a read transaction open across the install
+    /// keeps its old view until it ends.
+    pub fn connect(&self) -> Result<Arc<Connection>, Error> {
+        Ok(self.shared.db.connect(ConnectOpts::new())?)
+    }
+
+    /// The index of the last applied entry or installed snapshot, 0 before any.
+    pub fn applied_index(&self) -> u64 {
+        *self.shared.applied_index.lock().unwrap()
+    }
+
+    /// Waits until the entry at `index` is applied, at most `timeout`. Returns
+    /// whether it was. A read transaction started after `true` sees the entry.
+    pub fn wait_for_applied(&self, index: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut applied = self.shared.applied_index.lock().unwrap();
+        while *applied < index {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            applied = self
+                .shared
+                .applied_changed
+                .wait_timeout(applied, left)
+                .unwrap()
+                .0;
+        }
+        true
+    }
+}
+
+fn check_allowed(index: usize, sql: &str) -> Result<(), Error> {
+    use turso_parser::ast::{Cmd, Stmt};
+    let not_allowed = |reason: String| Error::NotAllowed { index, reason };
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+    let cmd = match parser.next() {
+        Some(Ok(cmd)) => cmd,
+        Some(Err(e)) => {
+            return Err(Error::Statement {
+                index,
+                source: LimboError::ParseError(e.to_string()),
+            })
+        }
+        None => return Err(not_allowed("no statement".to_string())),
+    };
+    if parser.next().is_some() {
+        return Err(not_allowed("more than one statement".to_string()));
+    }
+    if let Cmd::Stmt(
+        Stmt::Begin { .. }
+        | Stmt::Commit { .. }
+        | Stmt::Rollback { .. }
+        | Stmt::Savepoint { .. }
+        | Stmt::Release { .. },
+    ) = cmd
+    {
+        return Err(not_allowed("it controls the transaction".to_string()));
+    }
+    Ok(())
+}
+
+fn capture_in_transaction(
+    conn: &Arc<Connection>,
+    transactions: &[Vec<Statement>],
+) -> Result<Vec<Result<Captured, Error>>, Error> {
+    let base_index = read_applied(conn)?.map_or(0, |a| a.index);
+    let base_epoch = read_schema_epoch(conn)?;
+    let mut epoch = base_epoch;
+    let mut results = Vec::with_capacity(transactions.len());
+    for statements in transactions {
+        let allowed = statements
+            .iter()
+            .enumerate()
+            .try_for_each(|(index, s)| check_allowed(index, &s.sql));
+        if let Err(e) = allowed {
+            results.push(Err(e));
+            continue;
+        }
+        conn.execute("SAVEPOINT capture")?;
+        match run_and_read_changes(conn, statements) {
+            Ok((statement_results, changes)) => {
+                conn.execute("RELEASE capture")?;
+                let change_set = ChangeSet {
+                    base_index,
+                    schema_epoch: epoch,
+                    changes,
+                };
+                if change_set.changes_schema() {
+                    epoch += 1;
+                }
+                results.push(Ok(Captured {
+                    results: statement_results,
+                    change_set: change_set.encode(),
+                }));
+            }
+            Err(e) => {
+                if conn.get_auto_commit() {
+                    // The failure ended the database transaction.
+                    conn.execute("BEGIN IMMEDIATE")?;
+                    epoch = base_epoch;
+                } else {
+                    conn.execute("ROLLBACK TO capture")?;
+                    conn.execute("RELEASE capture")?;
+                }
+                results.push(Err(e));
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// Runs one transaction's statements inside the open database transaction
+/// and returns their results and the row changes they made.
+fn run_and_read_changes(
+    conn: &Arc<Connection>,
+    statements: &[Statement],
+) -> Result<(Vec<StatementResult>, Vec<RowChange>), Error> {
+    let start_change_id = max_change_id(conn)?;
+    let mut results = Vec::with_capacity(statements.len());
+    // (change_id it follows, record) for schema changes CDC does not record.
+    let mut schema_records = Vec::new();
+    for (index, statement) in statements.iter().enumerate() {
+        let failed = |source| Error::Statement { index, source };
+        let schema_before = if changes_trigger_or_view(&statement.sql) {
+            Some(triggers_and_views(conn)?)
+        } else {
+            None
+        };
+        let mut stmt = conn.prepare(&statement.sql).map_err(failed)?;
+        for (i, value) in statement.params.iter().enumerate() {
+            stmt.bind_at(NonZero::new(i + 1).unwrap(), value.clone())
+                .map_err(failed)?;
+        }
+        let columns = (0..stmt.num_columns())
+            .map(|i| stmt.get_column_name(i).into_owned())
+            .collect();
+        let rows = stmt.run_collect_rows().map_err(failed)?;
+        results.push(StatementResult {
+            columns,
+            rows,
+            rows_changed: stmt.n_change() as u64,
+        });
+        drop(stmt);
+        if let Some(before) = schema_before {
+            let after = triggers_and_views(conn)?;
+            let last_change_id = max_change_id(conn)?;
+            for change in schema_diff(&before, &after)? {
+                schema_records.push((last_change_id, change));
+            }
+        }
+    }
+    let cdc_rows = query(
+        conn,
+        "SELECT change_id, change_type, table_name, id, before, after, updates FROM turso_cdc \
+         WHERE change_id > ? ORDER BY change_id",
+        &[Value::from_i64(start_change_id)],
+    )?;
+    let mut changes: Vec<(i64, RowChange)> = cdc_rows
+        .into_iter()
+        .map(|row| {
+            let kind = match int(&row[1]) {
+                1 => ChangeKind::Insert,
+                0 => ChangeKind::Update,
+                -1 => ChangeKind::Delete,
+                t => unreachable!("change_type {t} before COMMIT"),
+            };
+            let Value::Text(table) = &row[2] else {
+                unreachable!("table_name is text: {:?}", row[2])
+            };
+            let mut change = RowChange {
+                kind,
+                table: table.as_str().to_string(),
+                id: int(&row[3]),
+                before: blob(&row[4]),
+                after: blob(&row[5]),
+                updates: blob(&row[6]),
+            };
+            // An UPDATE that changes an INTEGER PRIMARY KEY is recorded as a
+            // delete and an insert, and the insert's row image lands in
+            // `before` (`core/translate/emitter/update.rs` passes it in the
+            // before-record position).
+            if kind == ChangeKind::Insert && change.after.is_none() {
+                change.after = change.before.take();
+            }
+            (int(&row[0]), change)
+        })
+        .collect();
+    // A schema record goes after the CDC records of its own statement; the
+    // sort is stable, so records of one statement keep their order.
+    changes.extend(schema_records);
+    changes.sort_by_key(|(id, _)| *id);
+    Ok((results, changes.into_iter().map(|(_, c)| c).collect()))
+}
+
+fn max_change_id(conn: &Arc<Connection>) -> Result<i64, Error> {
+    Ok(int(&query(
+        conn,
+        "SELECT coalesce(max(change_id), 0) FROM turso_cdc",
+        &[],
+    )?[0][0]))
+}
+
+/// CDC records no change of `sqlite_schema` for triggers and views
+/// (`core/translate/trigger.rs`, `core/translate/view.rs`), so capture
+/// compares their schema rows around statements that may change them.
+fn changes_trigger_or_view(sql: &str) -> bool {
+    use turso_parser::ast::{Cmd, Stmt};
+    matches!(
+        turso_parser::parser::Parser::new(sql.as_bytes()).next(),
+        Some(Ok(Cmd::Stmt(
+            Stmt::CreateTrigger { .. }
+                | Stmt::DropTrigger { .. }
+                | Stmt::CreateView { .. }
+                | Stmt::DropView { .. }
+        )))
+    )
+}
+
+/// The `sqlite_schema` rows of triggers and views: rowid, then the five columns.
+fn triggers_and_views(conn: &Arc<Connection>) -> Result<Vec<Vec<Value>>, Error> {
+    query(
+        conn,
+        "SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema \
+         WHERE type IN ('trigger', 'view') ORDER BY rowid",
+        &[],
+    )
+}
+
+/// The `sqlite_schema` inserts and deletes that turn `before` into `after`.
+fn schema_diff(before: &[Vec<Value>], after: &[Vec<Value>]) -> Result<Vec<RowChange>, Error> {
+    let record = |row: &Vec<Value>| -> Result<Vec<u8>, Error> {
+        Ok(
+            turso_core::types::ImmutableRecord::from_values(&row[1..], 5)?
+                .into_payload()
+                .to_vec(),
+        )
+    };
+    let mut changes = Vec::new();
+    for row in before.iter().filter(|r| !after.contains(r)) {
+        changes.push(RowChange {
+            kind: ChangeKind::Delete,
+            table: "sqlite_schema".to_string(),
+            id: int(&row[0]),
+            before: Some(record(row)?),
+            after: None,
+            updates: None,
+        });
+    }
+    for row in after.iter().filter(|r| !before.contains(r)) {
+        changes.push(RowChange {
+            kind: ChangeKind::Insert,
+            table: "sqlite_schema".to_string(),
+            id: int(&row[0]),
+            before: None,
+            after: Some(record(row)?),
+            updates: None,
+        });
+    }
+    Ok(changes)
+}
+
+/// [`StateMachine`] over a [`NodeDb`]. `apply` rejects a change set that
+/// lost a write conflict; see the `apply` module for the rule.
+pub struct TursoStateMachine {
+    shared: Arc<Shared>,
+    check: bool,
+}
+
+impl StateMachine for TursoStateMachine {
+    type Error = Error;
+
+    fn applied(&mut self) -> Result<Option<Applied>, Error> {
+        read_applied(&self.shared.db.connect(ConnectOpts::new())?)
+    }
+
+    fn apply(&mut self, entry: &Entry) -> Result<Vec<Outcome>, Error> {
+        let _write = self.shared.write.lock().unwrap();
+        if entry.index <= *self.shared.applied_index.lock().unwrap() {
+            return Ok(Vec::new());
+        }
+        let tape = self.shared.tape.clone();
+        let mut session_conn = None;
+        let result = drive(&self.shared.io, |coro| {
+            apply::apply_entry(coro, tape, entry, self.check, &mut session_conn)
+        });
+        if result.is_err() {
+            if let Some(conn) = session_conn.filter(|c| !c.get_auto_commit()) {
+                conn.execute("ROLLBACK")?;
+            }
+        }
+        let outcomes = result?;
+        self.set_applied_index(entry.index);
+        Ok(outcomes)
+    }
+
+    fn snapshot(&mut self) -> Result<Snapshot, Error> {
+        let _write = self.shared.write.lock().unwrap();
+        let conn = self.shared.db.connect(ConnectOpts::new())?;
+        conn.execute("BEGIN")?;
+        // The first read starts the read transaction; the pages below are
+        // read at the same WAL position.
+        let applied = read_applied(&conn)?.unwrap_or(Applied {
+            index: 0,
+            raft_meta: Vec::new(),
+        });
+        let page_size = int(&query(&conn, "PRAGMA page_size", &[])?[0][0]) as usize;
+        let page_count = int(&query(&conn, "PRAGMA page_count", &[])?[0][0]) as u32;
+        let mut data = vec![0u8; page_size * page_count as usize];
+        for (i, page) in data.chunks_mut(page_size).enumerate() {
+            let found = conn.try_wal_watermark_read_page(i as u32 + 1, page, None)?;
+            assert!(found, "page {} of {page_count} exists", i + 1);
+        }
+        conn.execute("COMMIT")?;
+        Ok(Snapshot { applied, data })
+    }
+
+    fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), Error> {
+        let _write = self.shared.write.lock().unwrap();
+        let data = &snapshot.data;
+        if data.len() < 100 {
+            return Err(Error::Snapshot(
+                "shorter than a database header".to_string(),
+            ));
+        }
+        let page_size = match u16::from_be_bytes([data[16], data[17]]) {
+            1 => 65536,
+            n => n as usize,
+        };
+        if data.len() % page_size != 0 {
+            return Err(Error::Snapshot(format!(
+                "{} bytes is not a whole number of {page_size}-byte pages",
+                data.len()
+            )));
+        }
+        // Connections notice a new schema by a changed schema cookie. Give the
+        // installed file a cookie no connection has seen, so every connection
+        // re-reads the schema even if the two files had equal cookies.
+        let conn = self.shared.db.connect(ConnectOpts::new())?;
+        let local_cookie = int(&query(&conn, "PRAGMA schema_version", &[])?[0][0]) as u32;
+        let snapshot_cookie = u32::from_be_bytes(data[40..44].try_into().unwrap());
+        let mut page_1 = data[..page_size].to_vec();
+        page_1[40..44].copy_from_slice(&(local_cookie.max(snapshot_cookie) + 1).to_be_bytes());
+
+        let tape = self.shared.tape.clone();
+        drive(&self.shared.io, |coro| async move {
+            // All pages go into the WAL as one transaction; its commit frame
+            // sets the database size, which also drops any later local pages.
+            let mut session = tape.start_wal_session(&coro).await?;
+            for (i, page) in data.chunks(page_size).enumerate() {
+                session.append_page(i as u32 + 1, if i == 0 { &page_1 } else { page })?;
+            }
+            session.commit((data.len() / page_size) as u32)?;
+            session.wal_session.end(true)?;
+            Ok(())
+        })?;
+
+        let installed = read_applied(&conn)?;
+        assert_eq!(
+            installed.as_ref().map_or(0, |a| a.index),
+            snapshot.applied.index,
+            "the snapshot's data holds its applied position"
+        );
+        self.set_applied_index(snapshot.applied.index);
+        Ok(())
+    }
+}
+
+impl TursoStateMachine {
+    /// Turns the write-conflict check off or on (it is on by default), for
+    /// measuring what it costs. Every node of a cluster must use the same
+    /// setting, or they reach different outcomes.
+    pub fn set_conflict_check(&mut self, on: bool) {
+        self.check = on;
+    }
+
+    fn set_applied_index(&self, index: u64) {
+        *self.shared.applied_index.lock().unwrap() = index;
+        self.shared.applied_changed.notify_all();
+    }
+}
+
+/// Runs a sync-engine coroutine to completion, stepping Turso's IO whenever it
+/// waits.
+fn drive<T, F, Fut>(io: &Arc<dyn IO>, body: F) -> Result<T, Error>
+where
+    F: FnOnce(Coro<()>) -> Fut,
+    Fut: Future<Output = Result<T, Error>>,
+{
+    let mut gen = genawaiter::sync::Gen::new(|co| body(co.into()));
+    loop {
+        match gen.resume_with(Ok(())) {
+            genawaiter::GeneratorState::Yielded(_) => io.step()?,
+            genawaiter::GeneratorState::Complete(result) => return result,
+        }
+    }
+}
+
+fn read_applied(conn: &Arc<Connection>) -> Result<Option<Applied>, Error> {
+    let rows = query(
+        conn,
+        &format!("SELECT log_index, raft_meta FROM {APPLIED_TABLE} WHERE id = 0"),
+        &[],
+    )?;
+    Ok(rows.first().map(|row| Applied {
+        index: int(&row[0]) as u64,
+        raft_meta: blob(&row[1]).unwrap_or_default(),
+    }))
+}
+
+fn read_schema_epoch(conn: &Arc<Connection>) -> Result<u64, Error> {
+    let rows = query(
+        conn,
+        &format!("SELECT schema_epoch FROM {APPLIED_TABLE} WHERE id = 0"),
+        &[],
+    )?;
+    Ok(rows.first().map_or(0, |row| int(&row[0]) as u64))
+}
+
+fn query(conn: &Arc<Connection>, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, Error> {
+    let mut stmt = conn.prepare(sql)?;
+    for (i, value) in params.iter().enumerate() {
+        stmt.bind_at(NonZero::new(i + 1).unwrap(), value.clone())?;
+    }
+    Ok(stmt.run_collect_rows()?)
+}
+
+fn int(v: &Value) -> i64 {
+    match v {
+        Value::Numeric(Numeric::Integer(n)) => *n,
+        v => unreachable!("expected an integer, got {v:?}"),
+    }
+}
+
+fn blob(v: &Value) -> Option<Vec<u8>> {
+    match v {
+        Value::Blob(b) => Some(b.to_vec()),
+        Value::Null => None,
+        v => unreachable!("expected a blob, got {v:?}"),
+    }
+}

@@ -1,0 +1,10 @@
+[package]
+name = "tursoraft-statemachine"
+description = "Interface between the Raft layer and the replicated database"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true

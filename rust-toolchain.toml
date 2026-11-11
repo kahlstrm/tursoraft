@@ -1,0 +1,4 @@
+[toolchain]
+# The same toolchain as Turso at the pinned commit.
+channel = "1.88"
+components = ["clippy", "rustfmt"]

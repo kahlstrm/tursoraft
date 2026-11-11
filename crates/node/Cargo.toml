@@ -1,0 +1,12 @@
+[package]
+name = "tursoraft-node"
+description = "A tursoraft node: embeds the database and joins the Raft cluster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tursoraft-statemachine.workspace = true
+tursoraft-changeset.workspace = true
+tursoraft-raft.workspace = true

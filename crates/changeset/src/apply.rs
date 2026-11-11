@@ -46,13 +46,15 @@ use crate::{query, ChangeKind, ChangeSet, Error, RowChange, APPLIED_TABLE};
 const SQLITE_SCHEMA: &str = "sqlite_schema";
 
 /// Applies `entry` and records it as applied, with the new schema epoch, in
-/// the same transaction. `session_conn` receives the transaction's connection
-/// so that the caller can roll back after an error.
+/// the same transaction. Without `durable`, the commit is not synced to disk.
+/// `session_conn` receives the transaction's connection so that the caller
+/// can roll back after an error.
 pub(crate) async fn apply_entry(
     coro: Coro<()>,
     tape: Arc<DatabaseTape>,
     entry: &Entry,
     check: bool,
+    durable: bool,
     session_conn: &mut Option<Arc<Connection>>,
 ) -> Result<Vec<Outcome>, Error> {
     let opts = DatabaseReplaySessionOpts {
@@ -61,6 +63,9 @@ pub(crate) async fn apply_entry(
     let mut session = tape.start_replay_session(&coro, opts).await?;
     let conn = session.conn();
     *session_conn = Some(conn.clone());
+    if !durable {
+        conn.set_sync_mode(turso_core::SyncMode::Off);
+    }
     // Foreign keys are checked as they were at capture, so a proposal whose
     // parent row an earlier proposal deleted is rejected.
     conn.set_foreign_keys_enabled(true);

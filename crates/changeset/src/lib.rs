@@ -18,17 +18,22 @@
 //! - [`AheadDb`] is a second file for a leader that captures the next group
 //!   before the previous one is applied: groups run on it for real, so each
 //!   sees the ones before it.
+//! - [`NodeDb::begin`] opens a local transaction ([`LocalTx`]) whose
+//!   statements run one at a time on this file; its commit returns the
+//!   change set and rolls the transaction back.
 //! - [`NodeDb::connect`] gives connections for local reads, and
 //!   [`NodeDb::wait_for_applied`] waits until an entry has been applied.
 //!
-//! Capture and apply take one write lock per [`NodeDb`], so they run one at a
-//! time; neither sees Turso's "database is busy" from the other.
+//! Capture, apply and local transactions take one write lock per [`NodeDb`],
+//! so they run one at a time; none sees Turso's "database is busy" from
+//! another. See the `local` module for how a local transaction holds it.
 //!
 //! Foreign keys are enforced both when a transaction is captured and when it
 //! is applied.
 
 mod apply;
 mod changeset;
+mod local;
 
 use std::{
     future::Future,
@@ -47,6 +52,7 @@ use turso_sync_engine::{
 use tursoraft_statemachine::{Applied, Entry, Outcome, Snapshot, StateMachine};
 
 pub use changeset::{ChangeKind, ChangeSet, RowChange};
+pub use local::LocalTx;
 pub use turso_core;
 
 /// The table that holds the applied position, the schema epoch (the number of
@@ -81,6 +87,15 @@ pub enum Error {
     /// database transaction and undid this one. It had no effect.
     #[error("undone by the failure of transaction {by} of the same batch")]
     Undone { by: usize },
+    /// A local transaction ended without effect: it held the write lock
+    /// longer than the hold limit while an apply or another transaction
+    /// waited, or a failing statement ended it (`INSERT OR ROLLBACK`).
+    #[error("the local transaction was ended: {0}")]
+    Aborted(String),
+    /// A local transaction could not begin: another one held the write lock
+    /// for the whole wait.
+    #[error("busy: {0}")]
+    Busy(String),
 }
 
 /// One SQL statement and its parameters, bound by position.
@@ -137,8 +152,14 @@ struct Shared {
     io: Arc<dyn IO>,
     db: Arc<Database>,
     /// Held by capture, apply, snapshot and install_snapshot. Holds the
-    /// connection that captures, with CDC on.
+    /// connection that captures, with CDC on. Capture, apply and install also
+    /// claim `gate`.
     write: Mutex<Arc<Connection>>,
+    /// Who holds the database's write lock across calls; see `local`.
+    gate: local::Gate,
+    /// The connection of the open local transaction, with CDC on. One is
+    /// enough: one local transaction is open at a time.
+    local: Mutex<Arc<Connection>>,
     /// Replay connections have CDC off, so applying records nothing.
     tape: Arc<DatabaseTape>,
     applied_index: Mutex<u64>,
@@ -170,6 +191,10 @@ impl NodeDb {
         capture.execute("PRAGMA capture_data_changes_conn('full')")?;
         capture.set_busy_timeout(BUSY_TIMEOUT);
         capture.set_foreign_keys_enabled(true);
+        let local = db.connect(ConnectOpts::new())?;
+        local.execute("PRAGMA capture_data_changes_conn('full')")?;
+        local.set_busy_timeout(BUSY_TIMEOUT);
+        local.set_foreign_keys_enabled(true);
         let tape = Arc::new(DatabaseTape::new_with_opts(
             db.clone(),
             DatabaseTapeOpts {
@@ -184,6 +209,8 @@ impl NodeDb {
                 io,
                 db,
                 write: Mutex::new(capture),
+                gate: local::Gate::new(),
+                local: Mutex::new(local),
                 tape,
                 applied_index: Mutex::new(applied_index),
                 applied_changed: Condvar::new(),
@@ -227,7 +254,7 @@ impl NodeDb {
         &self,
         transactions: &[Vec<Statement>],
     ) -> Result<Vec<Result<Captured, Error>>, Error> {
-        let conn = self.shared.write.lock().unwrap();
+        let conn = self.shared.lock_writer()?;
         conn.execute("BEGIN IMMEDIATE")?;
         let result = capture_in_transaction(&conn, transactions, false);
         if !conn.get_auto_commit() {
@@ -332,7 +359,7 @@ impl AheadDb {
         &self,
         transactions: &[Vec<Statement>],
     ) -> Result<Vec<Result<Captured, Error>>, Error> {
-        let conn = self.db.shared.write.lock().unwrap();
+        let conn = self.db.shared.lock_writer()?;
         conn.execute("BEGIN IMMEDIATE")?;
         let result = capture_in_transaction(&conn, transactions, true).and_then(|r| {
             conn.execute("COMMIT")?;
@@ -350,6 +377,25 @@ impl AheadDb {
             }
         }
         Ok(results)
+    }
+
+    /// Checks change sets captured elsewhere against this file, in order,
+    /// as apply does, and keeps the effect of each one that passes, so later
+    /// captures here see it. Returns one outcome per change set. The applied
+    /// position of this file, the base of the change sets captured here,
+    /// stays as it is.
+    pub fn apply_incoming(&self, change_sets: &[Vec<u8>]) -> Result<Vec<Outcome>, Error> {
+        let write = self.db.shared.lock_writer()?;
+        let applied = read_applied(&write)?.unwrap_or(Applied {
+            index: 0,
+            raft_meta: Vec::new(),
+        });
+        let entry = Entry {
+            index: applied.index,
+            raft_meta: applied.raft_meta,
+            proposals: change_sets.to_vec(),
+        };
+        self.db.shared.apply_locked(&entry, true, false)
     }
 
     /// A connection to this file, for checks. It must not write.
@@ -471,35 +517,59 @@ fn run_and_read_changes(
     // (change_id it follows, record) for schema changes CDC does not record.
     let mut schema_records = Vec::new();
     for (index, statement) in statements.iter().enumerate() {
-        let failed = |source| Error::Statement { index, source };
-        let schema_before = if changes_trigger_or_view(&statement.sql) {
-            Some(triggers_and_views(conn)?)
-        } else {
-            None
-        };
-        let mut stmt = conn.prepare(&statement.sql).map_err(failed)?;
-        for (i, value) in statement.params.iter().enumerate() {
-            stmt.bind_at(NonZero::new(i + 1).unwrap(), value.clone())
-                .map_err(failed)?;
-        }
-        let columns = (0..stmt.num_columns())
-            .map(|i| stmt.get_column_name(i).into_owned())
-            .collect();
-        let rows = stmt.run_collect_rows().map_err(failed)?;
-        results.push(StatementResult {
-            columns,
-            rows,
-            rows_changed: stmt.n_change() as u64,
-        });
-        drop(stmt);
-        if let Some(before) = schema_before {
-            let after = triggers_and_views(conn)?;
-            let last_change_id = max_change_id(conn)?;
-            for change in schema_diff(&before, &after)? {
-                schema_records.push((last_change_id, change));
-            }
+        results.push(run_statement(conn, index, statement, &mut schema_records)?);
+    }
+    let changes = read_changes(conn, start_change_id, schema_records)?;
+    Ok((results, changes))
+}
+
+/// Runs one statement inside the open database transaction. Adds the
+/// schema changes CDC does not record to `schema_records`, each with the
+/// change_id it follows.
+fn run_statement(
+    conn: &Arc<Connection>,
+    index: usize,
+    statement: &Statement,
+    schema_records: &mut Vec<(i64, RowChange)>,
+) -> Result<StatementResult, Error> {
+    let failed = |source| Error::Statement { index, source };
+    let schema_before = if changes_trigger_or_view(&statement.sql) {
+        Some(triggers_and_views(conn)?)
+    } else {
+        None
+    };
+    let mut stmt = conn.prepare(&statement.sql).map_err(failed)?;
+    for (i, value) in statement.params.iter().enumerate() {
+        stmt.bind_at(NonZero::new(i + 1).unwrap(), value.clone())
+            .map_err(failed)?;
+    }
+    let columns = (0..stmt.num_columns())
+        .map(|i| stmt.get_column_name(i).into_owned())
+        .collect();
+    let rows = stmt.run_collect_rows().map_err(failed)?;
+    let result = StatementResult {
+        columns,
+        rows,
+        rows_changed: stmt.n_change() as u64,
+    };
+    drop(stmt);
+    if let Some(before) = schema_before {
+        let after = triggers_and_views(conn)?;
+        let last_change_id = max_change_id(conn)?;
+        for change in schema_diff(&before, &after)? {
+            schema_records.push((last_change_id, change));
         }
     }
+    Ok(result)
+}
+
+/// The row changes the open database transaction made after
+/// `start_change_id`, with `schema_records` in their places.
+fn read_changes(
+    conn: &Arc<Connection>,
+    start_change_id: i64,
+    schema_records: Vec<(i64, RowChange)>,
+) -> Result<Vec<RowChange>, Error> {
     let cdc_rows = query(
         conn,
         "SELECT change_id, change_type, table_name, id, before, after, updates FROM turso_cdc \
@@ -540,7 +610,7 @@ fn run_and_read_changes(
     // sort is stable, so records of one statement keep their order.
     changes.extend(schema_records);
     changes.sort_by_key(|(id, _)| *id);
-    Ok((results, changes.into_iter().map(|(_, c)| c).collect()))
+    Ok(changes.into_iter().map(|(_, c)| c).collect())
 }
 
 fn max_change_id(conn: &Arc<Connection>) -> Result<i64, Error> {
@@ -625,21 +695,11 @@ impl StateMachine for TursoStateMachine {
     }
 
     fn apply(&mut self, entry: &Entry) -> Result<Vec<Outcome>, Error> {
-        let _write = self.shared.write.lock().unwrap();
+        let _write = self.shared.lock_writer()?;
         if entry.index <= *self.shared.applied_index.lock().unwrap() {
             return Ok(Vec::new());
         }
-        let tape = self.shared.tape.clone();
-        let mut session_conn = None;
-        let result = drive(&self.shared.io, |coro| {
-            apply::apply_entry(coro, tape, entry, self.check, &mut session_conn)
-        });
-        if result.is_err() {
-            if let Some(conn) = session_conn.filter(|c| !c.get_auto_commit()) {
-                conn.execute("ROLLBACK")?;
-            }
-        }
-        let outcomes = result?;
+        let outcomes = self.shared.apply_locked(entry, self.check, true)?;
         self.set_applied_index(entry.index);
         Ok(outcomes)
     }
@@ -666,7 +726,7 @@ impl StateMachine for TursoStateMachine {
     }
 
     fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), Error> {
-        let _write = self.shared.write.lock().unwrap();
+        let _write = self.shared.lock_writer()?;
         let data = &snapshot.data;
         if data.len() < 100 {
             return Err(Error::Snapshot(
@@ -713,6 +773,29 @@ impl StateMachine for TursoStateMachine {
         );
         self.set_applied_index(snapshot.applied.index);
         Ok(())
+    }
+}
+
+impl Shared {
+    /// Applies `entry` with the caller holding the write lock. Without
+    /// `durable`, the commit is not synced to disk.
+    fn apply_locked(
+        &self,
+        entry: &Entry,
+        check: bool,
+        durable: bool,
+    ) -> Result<Vec<Outcome>, Error> {
+        let tape = self.tape.clone();
+        let mut session_conn = None;
+        let result = drive(&self.io, |coro| {
+            apply::apply_entry(coro, tape, entry, check, durable, &mut session_conn)
+        });
+        if result.is_err() {
+            if let Some(conn) = session_conn.filter(|c| !c.get_auto_commit()) {
+                conn.execute("ROLLBACK")?;
+            }
+        }
+        result
     }
 }
 

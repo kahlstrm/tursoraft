@@ -10,6 +10,8 @@
 //   GET  /admin/status         the follower's position              (secret)
 //   GET  /admin/dump           every copied table, exact values     (secret)
 //   POST /admin/close-relays   drop the relays' WebSockets          (secret)
+//   POST /admin/forget         delete the copy and the position, for a
+//                              cluster that started over            (secret)
 //
 // The secret is `Authorization: Bearer <RELAY_SECRET>`. Pages are public
 // and read only; nothing writes through this Worker.
@@ -81,6 +83,9 @@ async function admin(
     case "/admin/close-relays":
       if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
       return Response.json({ closed: await follower.closeRelays() });
+    case "/admin/forget":
+      if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+      return Response.json({ closed: await follower.forget() });
     default:
       return new Response("not found", { status: 404 });
   }

@@ -49,7 +49,7 @@ tursoraft node ── Node::subscribe ── relay ══ WebSocket ══> Work
 |---|---|
 | `GET /`, `GET /products/<id>` | Pages. `?at=<log index>` waits until the follower has applied that index (at most `?wait_ms=`, default 5000, capped at 30000; then 504). The response header `x-follower-through` is the index the page was read at |
 | `GET /relay?follower=<name>` | A relay's WebSocket. Needs the secret |
-| `GET /admin/status`, `GET /admin/dump`, `POST /admin/close-relays` | Position, every table with exact values, and dropping the relays' sockets. Need the secret |
+| `GET /admin/status`, `GET /admin/dump`, `POST /admin/close-relays`, `POST /admin/forget` | Position, every table with exact values, dropping the relays' sockets, and deleting the copy and the position (for a cluster that started over: the follower refuses a copy older than what it has). Need the secret |
 
 The secret is sent as `Authorization: Bearer <RELAY_SECRET>`. `?follower=`
 picks the follower DO by name; it defaults to `FOLLOWER_NAME`.

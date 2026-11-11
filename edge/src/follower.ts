@@ -218,6 +218,29 @@ export class Follower extends DurableObject<Env> {
     return sockets.length;
   }
 
+  /// Deletes every copied table and the position, and closes the relays'
+  /// WebSockets, so that the next copy may be at any log index. For a
+  /// cluster that started over from an empty database: otherwise this
+  /// follower refuses its copies, which are at lower indexes than its own.
+  forget(): number {
+    this.ctx.storage.transactionSync(() => {
+      this.dropStaging();
+      const live = this.userObjects();
+      for (const { name } of live.filter((o) => o.type === "view")) {
+        this.sql.exec(`DROP VIEW ${quote(name)}`);
+      }
+      for (const { name } of live.filter((o) => o.type === "table")) {
+        this.sql.exec(`DROP TABLE ${quote(name)}`);
+      }
+      this.sql.exec(
+        `UPDATE ${STATE} SET through = 0, last_index = 0, last_position = -1, stream = NULL,
+           seq = 0, copy_index = NULL, copy_schema = NULL, copy_tables = NULL`,
+      );
+    });
+    this.tables.clear();
+    return this.closeRelays();
+  }
+
   /// Applies one relay message and returns the new `through`.
   private handle(msg: RelayMessage): number {
     if (this.sql.exec<{ foreign_keys: number }>("PRAGMA foreign_keys").one().foreign_keys !== 0) {

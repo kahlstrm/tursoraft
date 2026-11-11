@@ -305,6 +305,30 @@ test("after a failed message the stream is refused until a new copy", async () =
   assert.equal(state.through, 12);
 });
 
+test("a forgotten follower takes a copy at a lower log index", async () => {
+  const relay = await connect("forgotten");
+  await copyProducts(relay, 50);
+  let reply = await relay.send({ t: "copy_begin", index: 3, schema: [], tables: [] });
+  assert.equal(reply.t, "error");
+  const forget = await edge.mf.dispatchFetch(`${edge.url}/admin/forget?follower=forgotten`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${SECRET}` },
+  });
+  assert.deepEqual(await forget.json(), { closed: 1 });
+  assert.equal((await get("/?follower=forgotten")).status, 503, "the old copy is gone");
+  const unauthorized = await edge.mf.dispatchFetch(`${edge.url}/admin/forget?follower=forgotten`, {
+    method: "POST",
+  });
+  assert.equal(unauthorized.status, 401);
+  const again = await connect("forgotten");
+  assert.equal(again.hello.through, 0);
+  await copyProducts(again, 3, [{ id: 9, title: "Fresh", price: 1, stock: 2, available: 2 }]);
+  const page = await get("/?follower=forgotten");
+  assert.match(page.text, /Fresh/);
+  assert.doesNotMatch(page.text, /Tea/);
+  assert.equal(page.through, "3");
+});
+
 test("foreign-key actions do not run while applying", async () => {
   const relay = await connect("cascade");
   await copyProducts(relay, 1);

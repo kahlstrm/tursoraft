@@ -29,8 +29,9 @@ pub const FOLLOWER: &str = "default";
 /// The Worker and follower Durable Object, run by `edge/test/serve.mjs`.
 pub struct Edge {
     pub url: String,
-    _child: Child,
-    stdin: ChildStdin,
+    child: Child,
+    /// Closing it stops Miniflare; see [`Drop`].
+    stdin: Option<ChildStdin>,
     stdout: Lines<BufReader<ChildStdout>>,
     http: reqwest::Client,
 }
@@ -48,7 +49,8 @@ impl Edge {
             .env("RELAY_SECRET", SECRET)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .kill_on_drop(true)
+            // Its own group, so that Drop can stop Miniflare's workerd too.
+            .process_group(0)
             .spawn()
             .expect("run node");
         let stdin = child.stdin.take().unwrap();
@@ -64,8 +66,8 @@ impl Edge {
             .to_string();
         Edge {
             url,
-            _child: child,
-            stdin,
+            child,
+            stdin: Some(stdin),
             stdout,
             http: reqwest::Client::new(),
         }
@@ -200,11 +202,34 @@ impl Edge {
     /// Removes the follower from memory, keeping its WebSockets open.
     pub async fn evict(&mut self, follower: &str) {
         self.stdin
+            .as_mut()
+            .unwrap()
             .write_all(format!("evict {follower}\n").as_bytes())
             .await
             .unwrap();
         let line = self.stdout.next_line().await.unwrap().unwrap();
         assert_eq!(line, "evicted");
+    }
+}
+
+/// Closes serve.mjs's stdin, which stops Miniflare and its workerd, waits
+/// for it a little, then kills its whole process group. Killing node alone
+/// leaves workerd running.
+impl Drop for Edge {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        for _ in 0..100 {
+            if !matches!(self.child.try_wait(), Ok(None)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if let Some(pid) = self.child.id() {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 }
 
